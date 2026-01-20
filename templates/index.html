@@ -6,23 +6,58 @@
 </head>
 <body>
 
-<h1>Controle do LED ESP32</h1>
-<h2>Status: <span id="status">{{ led }}</span></h2>
+    <h1>Controle do ESP32</h1>
 
-<button onclick="enviar('on')">LIGAR</button>
-<button onclick="enviar('off')">DESLIGAR</button>
+    <!-- STATUS ATUAL -->
+    <h2>Status do LED: <span id="status-led">{{ led }}</span></h2>
+    <h2>Mensagem atual: <span id="status-msg">{{ msg }}</span></h2>
 
-<script>
-function enviar(valor) {
-    fetch("/comando", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({ led: valor })
-    }).then(() => {
-        document.getElementById("status").innerText = valor;
-    });
-}
-</script>
+    <hr>
+
+    <!-- CONTROLE DO LED -->
+    <h3>Controle do LED</h3>
+    <button onclick="enviarLed('on')">LIGAR</button>
+    <button onclick="enviarLed('off')">DESLIGAR</button>
+
+    <hr>
+
+    <!-- ENVIO DE MENSAGEM -->
+    <h3>Enviar mensagem para o ESP32</h3>
+    <input type="text" id="mensagem" placeholder="Digite a mensagem">
+    <button onclick="enviarMensagem()">ENVIAR</button>
+
+    <script>
+        // ENVIA COMANDO DO LED
+        function enviarLed(valor) {
+            fetch("/comando", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({ led: valor })
+            })
+            .then(() => {
+                document.getElementById("status-led").innerText = valor;
+            });
+        }
+
+        // ENVIA MENSAGEM PARA O ESP32
+        function enviarMensagem() {
+            const texto = document.getElementById("mensagem").value;
+
+            fetch("/mensagem", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({ msg: texto })
+            })
+            .then(() => {
+                document.getElementById("status-msg").innerText = texto;
+                document.getElementById("mensagem").value = "";
+            });
+        }
+    </script>
 
 </body>
 </html>
