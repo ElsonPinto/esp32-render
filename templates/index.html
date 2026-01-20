@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <title>Controle ESP32</title>
+</head>
+<body>
+
+<h1>Controle do LED ESP32</h1>
+<h2>Status: <span id="status">{{ led }}</span></h2>
+
+<button onclick="enviar('on')">LIGAR</button>
+<button onclick="enviar('off')">DESLIGAR</button>
+
+<script>
+function enviar(valor) {
+    fetch("/comando", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ led: valor })
+    }).then(() => {
+        document.getElementById("status").innerText = valor;
+    });
+}
+</script>
+
+</body>
+</html>
