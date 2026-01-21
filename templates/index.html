@@ -2,62 +2,141 @@
 <html lang="pt-br">
 <head>
     <meta charset="UTF-8">
-    <title>Controle ESP32</title>
+    <title>Painel ESP32</title>
+    <style>
+        body {
+            font-family: Arial;
+            background: #f4f4f4;
+            padding: 20px;
+        }
+        h1 {
+            color: #333;
+        }
+        section {
+            background: #fff;
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+        }
+        button {
+            padding: 10px;
+            margin: 5px 0;
+            cursor: pointer;
+        }
+        input {
+            padding: 8px;
+            width: 100%;
+            margin: 5px 0;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            border: 1px solid #ccc;
+            padding: 6px;
+            font-size: 12px;
+            text-align: center;
+        }
+        th {
+            background: #eee;
+        }
+    </style>
 </head>
 <body>
 
-    <h1>Controle do ESP32</h1>
+<h1>📡 Painel de Controle ESP32</h1>
 
-    <!-- STATUS ATUAL -->
-    <h2>Status do LED: <span id="status-led">{{ led }}</span></h2>
-    <h2>Mensagem atual: <span id="status-msg">{{ msg }}</span></h2>
+<!-- ================= LED ================= -->
+<section>
+    <h2>💡 Controle do LED</h2>
+    <p>Status atual: <strong>{{ led }}</strong></p>
 
-    <hr>
+    <button onclick="setLed('on')">LIGAR</button>
+    <button onclick="setLed('off')">DESLIGAR</button>
+</section>
 
-    <!-- CONTROLE DO LED -->
-    <h3>Controle do LED</h3>
-    <button onclick="enviarLed('on')">LIGAR</button>
-    <button onclick="enviarLed('off')">DESLIGAR</button>
+<!-- ================= MENSAGEM ================= -->
+<section>
+    <h2>✉️ Enviar Mensagem para o ESP32</h2>
+    <input type="text" id="msg" placeholder="Digite a mensagem">
+    <button onclick="enviarMensagem()">Enviar</button>
+    <p>Última mensagem: <strong>{{ msg }}</strong></p>
+</section>
 
-    <hr>
+<!-- ================= DADOS ================= -->
+<section>
+    <h2>📊 Histórico de Dados do ESP32</h2>
+    <button onclick="carregarDados()">Atualizar</button>
 
-    <!-- ENVIO DE MENSAGEM -->
-    <h3>Enviar mensagem para o ESP32</h3>
-    <input type="text" id="mensagem" placeholder="Digite a mensagem">
-    <button onclick="enviarMensagem()">ENVIAR</button>
+    <table id="tabela">
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Fazenda</th>
+                <th>Dispositivo</th>
+                <th>Temp</th>
+                <th>U1</th>
+                <th>U2</th>
+                <th>U3</th>
+                <th>U4</th>
+                <th>U5</th>
+                <th>Fruto</th>
+                <th>Data</th>
+                <th>Hora</th>
+            </tr>
+        </thead>
+        <tbody></tbody>
+    </table>
+</section>
 
-    <script>
-        // ENVIA COMANDO DO LED
-        function enviarLed(valor) {
-            fetch("/comando", {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify({ led: valor })
-            })
-            .then(() => {
-                document.getElementById("status-led").innerText = valor;
+<script>
+function setLed(valor) {
+    fetch("/comando", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ led: valor })
+    });
+}
+
+function enviarMensagem() {
+    const texto = document.getElementById("msg").value;
+
+    fetch("/mensagem", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ msg: texto })
+    });
+}
+
+function carregarDados() {
+    fetch("/api/registros")
+        .then(res => res.json())
+        .then(dados => {
+            const tbody = document.querySelector("#tabela tbody");
+            tbody.innerHTML = "";
+
+            dados.forEach(linha => {
+                const tr = document.createElement("tr");
+                tr.innerHTML = `
+                    <td>${linha.id}</td>
+                    <td>${linha.fazenda_id}</td>
+                    <td>${linha.dispositivo_id}</td>
+                    <td>${linha.temperatura}</td>
+                    <td>${linha.umidade_1}</td>
+                    <td>${linha.umidade_2}</td>
+                    <td>${linha.umidade_3}</td>
+                    <td>${linha.umidade_4}</td>
+                    <td>${linha.umidade_5}</td>
+                    <td>${linha.fruto}</td>
+                    <td>${linha.data}</td>
+                    <td>${linha.hora}</td>
+                `;
+                tbody.appendChild(tr);
             });
-        }
-
-        // ENVIA MENSAGEM PARA O ESP32
-        function enviarMensagem() {
-            const texto = document.getElementById("mensagem").value;
-
-            fetch("/mensagem", {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify({ msg: texto })
-            })
-            .then(() => {
-                document.getElementById("status-msg").innerText = texto;
-                document.getElementById("mensagem").value = "";
-            });
-        }
-    </script>
+        });
+}
+</script>
 
 </body>
 </html>
