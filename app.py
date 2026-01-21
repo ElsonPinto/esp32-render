@@ -92,6 +92,18 @@ def status():
         "mensagem": mensagem
     })
 
+
+
+# ===============================
+# MOSTRAR PAGINA OLINE NAVEGADOR
+# ===============================
+@app.route("/api/esp32", methods=["GET"])
+def teste_api_esp32():
+    return jsonify({"status": "API ESP32 online"})
+
+
+
+
 # ===============================
 # ROTA PARA RECEBER DADOS DO ESP32
 # ===============================
@@ -152,3 +164,4 @@ if __name__ == "__main__":
     criar_tabela()  # garante que o banco exista
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
