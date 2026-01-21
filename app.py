@@ -101,46 +101,60 @@ def status():
 def teste_api_esp32():
     return jsonify({"status": "API ESP32 online"})
 
-
-
-
-# ===============================
-# ROTA PARA RECEBER DADOS DO ESP32
-# ===============================
 @app.route("/api/esp32", methods=["POST"])
 def receber_esp32():
-    recebido = request.json
+    try:
+        recebido = request.get_json(force=True)
 
-    conn = conectar_db()
-    cursor = conn.cursor()
+        return jsonify({
+            "status": "json recebido",
+            "dados": recebido
+        })
 
-    cursor.execute("""
-        INSERT INTO registros (
-            fazenda_id, dispositivo_id, pacote_id, ip, mac,
-            umidade_1, umidade_2, umidade_3, umidade_4, umidade_5,
-            temperatura, fruto, data, hora
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        recebido.get("fazenda_id"),
-        recebido.get("dispositivo_id"),
-        recebido.get("pacote_id"),
-        recebido.get("ip"),
-        recebido.get("mac"),
-        recebido.get("umidade_1"),
-        recebido.get("umidade_2"),
-        recebido.get("umidade_3"),
-        recebido.get("umidade_4"),
-        recebido.get("umidade_5"),
-        recebido.get("temperatura"),
-        recebido.get("fruto"),
-        recebido.get("data"),
-        recebido.get("hora")
-    ))
+    except Exception as e:
+        return jsonify({
+            "erro": str(e)
+        }), 500
 
-    conn.commit()
-    conn.close()
 
-    return jsonify({"status": "dados salvos no banco"})
+
+# # ===============================
+# # ROTA PARA RECEBER DADOS DO ESP32
+# # ===============================
+# @app.route("/api/esp32", methods=["POST"])
+# def receber_esp32():
+#     recebido = request.json
+
+#     conn = conectar_db()
+#     cursor = conn.cursor()
+
+#     cursor.execute("""
+#         INSERT INTO registros (
+#             fazenda_id, dispositivo_id, pacote_id, ip, mac,
+#             umidade_1, umidade_2, umidade_3, umidade_4, umidade_5,
+#             temperatura, fruto, data, hora
+#         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+#     """, (
+#         recebido.get("fazenda_id"),
+#         recebido.get("dispositivo_id"),
+#         recebido.get("pacote_id"),
+#         recebido.get("ip"),
+#         recebido.get("mac"),
+#         recebido.get("umidade_1"),
+#         recebido.get("umidade_2"),
+#         recebido.get("umidade_3"),
+#         recebido.get("umidade_4"),
+#         recebido.get("umidade_5"),
+#         recebido.get("temperatura"),
+#         recebido.get("fruto"),
+#         recebido.get("data"),
+#         recebido.get("hora")
+#     ))
+
+#     conn.commit()
+#     conn.close()
+
+#     return jsonify({"status": "dados salvos no banco"})
 
 # ===============================
 # ROTA PARA VER HISTÓRICO
@@ -164,4 +178,5 @@ if __name__ == "__main__":
     criar_tabela()  # garante que o banco exista
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
