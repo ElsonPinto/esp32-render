@@ -101,60 +101,56 @@ def status():
 def teste_api_esp32():
     return jsonify({"status": "API ESP32 online"})
 
-@app.route("/api/esp32", methods=["POST"])
-def receber_esp32():
-    try:
-        recebido = request.get_json(force=True)
 
-        return jsonify({
-            "status": "json recebido",
-            "dados": recebido
-        })
-
-    except Exception as e:
-        return jsonify({
-            "erro": str(e)
-        }), 500
 
 
 
 # # ===============================
 # # ROTA PARA RECEBER DADOS DO ESP32
 # # ===============================
-# @app.route("/api/esp32", methods=["POST"])
-# def receber_esp32():
-#     recebido = request.json
+@app.route("/api/esp32", methods=["POST"])
+def receber_esp32():
+    try:
+        recebido = request.get_json(force=True)
 
-#     conn = conectar_db()
-#     cursor = conn.cursor()
+        conn = conectar_db()
+        cursor = conn.cursor()
 
-#     cursor.execute("""
-#         INSERT INTO registros (
-#             fazenda_id, dispositivo_id, pacote_id, ip, mac,
-#             umidade_1, umidade_2, umidade_3, umidade_4, umidade_5,
-#             temperatura, fruto, data, hora
-#         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-#     """, (
-#         recebido.get("fazenda_id"),
-#         recebido.get("dispositivo_id"),
-#         recebido.get("pacote_id"),
-#         recebido.get("ip"),
-#         recebido.get("mac"),
-#         recebido.get("umidade_1"),
-#         recebido.get("umidade_2"),
-#         recebido.get("umidade_3"),
-#         recebido.get("umidade_4"),
-#         recebido.get("umidade_5"),
-#         recebido.get("temperatura"),
-#         recebido.get("fruto"),
-#         recebido.get("data"),
-#         recebido.get("hora")
-#     ))
+        cursor.execute("""
+            INSERT INTO registros (
+                fazenda_id, dispositivo_id, pacote_id, ip, mac,
+                umidade_1, umidade_2, umidade_3, umidade_4, umidade_5,
+                temperatura, fruto, data, hora
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            recebido.get("fazenda_id"),
+            recebido.get("dispositivo_id"),
+            recebido.get("pacote_id"),
+            recebido.get("ip"),
+            recebido.get("mac"),
+            recebido.get("umidade_1"),
+            recebido.get("umidade_2"),
+            recebido.get("umidade_3"),
+            recebido.get("umidade_4"),
+            recebido.get("umidade_5"),
+            recebido.get("temperatura"),
+            recebido.get("fruto"),
+            recebido.get("data"),
+            recebido.get("hora")
+        ))
 
-#     conn.commit()
-#     conn.close()
+        conn.commit()
+        conn.close()
 
-#     return jsonify({"status": "dados salvos no banco"})
+        return jsonify({"status": "dados salvos com sucesso"})
+
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
+
+
+
+
+
 
 # ===============================
 # ROTA PARA VER HISTÓRICO
