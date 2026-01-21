@@ -1,29 +1,23 @@
 from flask import Flask, request, jsonify, render_template
-import os
 import sqlite3
+import os
 
-# ===============================
-# CRIA O SERVIDOR FLASK
-# ===============================
 app = Flask(__name__)
 
 # ===============================
-# VARIÁVEIS GLOBAIS (ESTADO)
+# VARIÁVEIS GLOBAIS
 # ===============================
-estado_led = "off"                 # on / off
-mensagem = "Nenhuma mensagem"      # texto para o ESP32
+estado_led = "off"
+mensagem = "Nenhuma mensagem"
 
 # ===============================
-# FUNÇÃO PARA CONECTAR AO BANCO
+# BANCO DE DADOS
 # ===============================
 def conectar_db():
     conn = sqlite3.connect("dados.db")
     conn.row_factory = sqlite3.Row
     return conn
 
-# ===============================
-# CRIAR TABELA AUTOMATICAMENTE
-# ===============================
 def criar_tabela():
     conn = conectar_db()
     cursor = conn.cursor()
@@ -31,18 +25,9 @@ def criar_tabela():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS registros (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            fazenda_id TEXT,
             dispositivo_id TEXT,
-            pacote_id TEXT,
-            ip TEXT,
-            mac TEXT,
-            umidade_1 REAL,
-            umidade_2 REAL,
-            umidade_3 REAL,
-            umidade_4 REAL,
-            umidade_5 REAL,
+            umidade REAL,
             temperatura REAL,
-            fruto TEXT,
             data TEXT,
             hora TEXT
         )
@@ -52,38 +37,46 @@ def criar_tabela():
     conn.close()
 
 # ===============================
-# ROTA PRINCIPAL - PÁGINA WEB
+# PÁGINA PRINCIPAL
 # ===============================
 @app.route("/")
 def index():
-    return render_template(
-        "index.html",
-        led=estado_led,
-        msg=mensagem
-    )
+    return f"""
+    <h1>Controle ESP32</h1>
+
+    <h2>LED: {estado_led}</h2>
+
+    <form action="/comando" method="post">
+        <button name="led" value="on">Ligar LED</button>
+        <button name="led" value="off">Desligar LED</button>
+    </form>
+
+    <form action="/mensagem" method="post">
+        <input name="msg" placeholder="Mensagem para o ESP32">
+        <button>Enviar Mensagem</button>
+    </form>
+    """
 
 # ===============================
-# ROTA PARA CONTROLAR O LED
+# COMANDO LED
 # ===============================
 @app.route("/comando", methods=["POST"])
 def comando():
     global estado_led
-    dados = request.json
-    estado_led = dados.get("led", "off")
+    estado_led = request.form.get("led") or request.json.get("led")
     return jsonify({"status": "ok", "led": estado_led})
 
 # ===============================
-# ROTA PARA ENVIAR MENSAGEM
+# ENVIAR MENSAGEM
 # ===============================
 @app.route("/mensagem", methods=["POST"])
 def set_mensagem():
     global mensagem
-    dados = request.json
-    mensagem = dados.get("msg", "")
-    return jsonify({"status": "mensagem recebida", "mensagem": mensagem})
+    mensagem = request.form.get("msg") or request.json.get("msg")
+    return jsonify({"mensagem": mensagem})
 
 # ===============================
-# ROTA PARA O ESP32 CONSULTAR
+# ESP32 CONSULTA
 # ===============================
 @app.route("/status", methods=["GET"])
 def status():
@@ -92,71 +85,37 @@ def status():
         "mensagem": mensagem
     })
 
-
-
 # ===============================
-# MOSTRAR PAGINA OLINE NAVEGADOR
+# ESP32 ENVIA DADOS
 # ===============================
-@app.route("/api/esp32", methods=["GET"])
-def teste_api_esp32():
-    return jsonify({"status": "API ESP32 online"})
-
-
-
-
-
-# # ===============================
-# # ROTA PARA RECEBER DADOS DO ESP32
-# # ===============================
 @app.route("/api/esp32", methods=["POST"])
 def receber_esp32():
-    try:
-        recebido = request.get_json(force=True)
+    dados = request.get_json()
 
-        conn = conectar_db()
-        cursor = conn.cursor()
+    conn = conectar_db()
+    cursor = conn.cursor()
 
-        cursor.execute("""
-            INSERT INTO registros (
-                fazenda_id, dispositivo_id, pacote_id, ip, mac,
-                umidade_1, umidade_2, umidade_3, umidade_4, umidade_5,
-                temperatura, fruto, data, hora
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            recebido.get("fazenda_id"),
-            recebido.get("dispositivo_id"),
-            recebido.get("pacote_id"),
-            recebido.get("ip"),
-            recebido.get("mac"),
-            recebido.get("umidade_1"),
-            recebido.get("umidade_2"),
-            recebido.get("umidade_3"),
-            recebido.get("umidade_4"),
-            recebido.get("umidade_5"),
-            recebido.get("temperatura"),
-            recebido.get("fruto"),
-            recebido.get("data"),
-            recebido.get("hora")
-        ))
+    cursor.execute("""
+        INSERT INTO registros (dispositivo_id, umidade, temperatura, data, hora)
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        dados.get("dispositivo_id"),
+        dados.get("umidade"),
+        dados.get("temperatura"),
+        dados.get("data"),
+        dados.get("hora")
+    ))
 
-        conn.commit()
-        conn.close()
+    conn.commit()
+    conn.close()
 
-        return jsonify({"status": "dados salvos com sucesso"})
-
-    except Exception as e:
-        return jsonify({"erro": str(e)}), 500
-
-
-
-
-
+    return jsonify({"status": "dados salvos"})
 
 # ===============================
-# ROTA PARA VER HISTÓRICO
+# VER DADOS NO NAVEGADOR
 # ===============================
 @app.route("/api/registros", methods=["GET"])
-def listar_registros():
+def listar():
     conn = conectar_db()
     cursor = conn.cursor()
 
@@ -164,15 +123,11 @@ def listar_registros():
     rows = cursor.fetchall()
 
     conn.close()
-
-    return jsonify([dict(row) for row in rows])
+    return jsonify([dict(r) for r in rows])
 
 # ===============================
-# INICIALIZAÇÃO DO SERVIDOR
+# START
 # ===============================
 if __name__ == "__main__":
-    criar_tabela()  # garante que o banco exista
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
-
-
+    criar_tabela()
+    app.run(host="0.0.0.0", port=5000, debug=True)
