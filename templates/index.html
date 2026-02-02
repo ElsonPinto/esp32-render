@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<title>Controle ESP32</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<style>
+body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background:#f4f4f4; }
+button { margin: 8px; padding: 12px 25px; font-size: 16px; cursor: pointer; }
+input { padding: 6px; font-size: 16px; margin: 4px; }
+
+.page { display: none; }
+.back { margin-top: 20px; background:#ddd; }
+
+.menu button { width: 280px; display:block; margin:auto; }
+
+table {
+    width:100%;
+    border-collapse:collapse;
+    margin-top:10px;
+}
+
+th, td {
+    border:1px solid #ccc;
+    padding:10px;
+    text-align:center;
+}
+
+th {
+    background:#eaeaea;
+}
+
+/* ======= VÁLVULAS ======= */
+.valvula {
+    margin-top:30px;
+}
+
+.valvula h2 {
+    background:#4CAF50;
+    color:white;
+    padding:12px;
+    border-radius:6px 6px 0 0;
+    font-size:20px;
+    margin:0;
+}
+
+.valvula table tr:nth-child(even) {
+    background:#f9f9f9;
+}
+
+@media(max-width:600px){
+    body { padding:10px; }
+    .valvula h2 { font-size:18px; }
+}
+</style>
+</head>
+
+<body>
+
+<!-- ================= MENU ================= -->
+<div id="menu" class="page" style="display:block">
+    <h1 style="text-align:center;">Controle ESP32</h1>
+    <div class="menu">
+        <button onclick="showPage('comandos')">🔌 Comandos</button>
+        <button onclick="showPage('api')">📡 Registros</button>
+        <button onclick="showPage('sd')">💾 Horários</button>
+    </div>
+</div>
+
+<!-- ================= COMANDOS ================= -->
+<div id="comandos" class="page">
+    <h2>🔌 Comandos</h2>
+
+    <h3>LED: <span id="estado-led">off</span></h3>
+    <button onclick="ligarLed()">Ligar</button>
+    <button onclick="desligarLed()">Desligar</button>
+
+    <h3>Mensagem</h3>
+    <input type="text" id="msg" placeholder="Mensagem para o ESP32">
+    <button onclick="enviarMensagem()">Enviar</button>
+
+    <button class="back" onclick="showPage('menu')">⬅ Voltar</button>
+</div>
+
+<!-- ================= REGISTROS ================= -->
+<div id="api" class="page">
+    <h2>📡 Registros</h2>
+
+    <button onclick="baixarDados()">📥 Baixar TXT</button>
+
+    <table id="tabela-registros">
+        <thead>
+            <tr>
+                <th>ID</th><th>Pacote</th><th>Fazenda</th><th>Disp.</th>
+                <th>Temp</th><th>U1</th><th>U2</th><th>U3</th><th>U4</th><th>U5</th>
+                <th>Fruto</th><th>Data</th><th>Hora</th><th>IP</th><th>MAC</th>
+            </tr>
+        </thead>
+        <tbody></tbody>
+    </table>
+
+    <button class="back" onclick="showPage('menu')">⬅ Voltar</button>
+</div>
+
+<!-- ================= HORÁRIOS ================= -->
+<div id="sd" class="page">
+    <h1>💾 Configurações das Válvulas</h1>
+
+    <button onclick="requisitarHorarios()">📥 Ler horários do ESP32</button>
+
+    <div id="valvulas"></div>
+
+    <hr>
+
+    <h2>✏️ Editar / Enviar horário para o ESP32</h2>
+
+    <label>Válvula (0–31):</label>
+    <input type="number" id="canal" min="0" max="31" value="0">
+
+    <label>Slot (0–14):</label>
+    <input type="number" id="slot" min="0" max="14" value="0">
+
+    <br><br>
+
+    <label>Ligar:</label>
+    <input type="number" id="horaL" min="0" max="23">
+    <input type="number" id="minL" min="0" max="59">
+
+    <label>Desligar:</label>
+    <input type="number" id="horaD" min="0" max="23">
+    <input type="number" id="minD" min="0" max="59">
+
+    <br><br>
+
+    <label>Dias:</label><br>
+    <label><input type="checkbox" class="dia" value="0"> Dom</label>
+    <label><input type="checkbox" class="dia" value="1"> Seg</label>
+    <label><input type="checkbox" class="dia" value="2"> Ter</label>
+    <label><input type="checkbox" class="dia" value="3"> Qua</label>
+    <label><input type="checkbox" class="dia" value="4"> Qui</label>
+    <label><input type="checkbox" class="dia" value="5"> Sex</label>
+    <label><input type="checkbox" class="dia" value="6"> Sáb</label>
+
+    <br><br>
+
+    <button onclick="editarHorario()">💾 Enviar horário ao ESP32</button>
+
+    <button class="back" onclick="showPage('menu')">⬅ Voltar</button>
+</div>
+
+<script>
+// ================= NAVEGAÇÃO =================
+function showPage(id){
+    document.querySelectorAll(".page").forEach(p=>p.style.display="none");
+    document.getElementById(id).style.display="block";
+}
+
+// ================= LED =================
+function ligarLed(){
+    fetch("/comando",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({led:"on"})})
+    .then(r=>r.json()).then(d=>estadoLed(d.led));
+}
+function desligarLed(){
+    fetch("/comando",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({led:"off"})})
+    .then(r=>r.json()).then(d=>estadoLed(d.led));
+}
+function estadoLed(e){ document.getElementById("estado-led").innerText=e; }
+
+// ================= MENSAGEM =================
+function enviarMensagem(){
+    fetch("/mensagem",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({msg:msg.value})});
+    msg.value="";
+}
+
+// ================= REGISTROS =================
+function baixarDados(){ location.href="/api/registros/txt"; }
+
+function atualizarRegistros(){
+    fetch("/api/registros").then(r=>r.json()).then(d=>{
+        const t=document.querySelector("#tabela-registros tbody");
+        t.innerHTML="";
+        d.forEach(r=>{
+            t.innerHTML+=`<tr>${Object.values(r).map(v=>`<td>${v??""}</td>`).join("")}</tr>`;
+        });
+    });
+}
+
+// ================= HORÁRIOS =================
+function requisitarHorarios(){
+    fetch("/api/horarios/requisitar",{method:"POST"})
+    .then(()=>alert("Pedido enviado ao ESP32"));
+}
+
+function atualizarHorarios(){
+    fetch("/api/horarios")
+    .then(r=>r.json())
+    .then(dados=>{
+        const container=document.getElementById("valvulas");
+        container.innerHTML="";
+
+        const diasNome=["Dom","Seg","Ter","Qua","Qui","Sex","Sáb"];
+        let valvulas={};
+
+        dados.forEach(h=>{
+            if(h.hora_ligar==="-1:-1") return;
+
+            const v=Math.floor(h.linha/15);
+            const slot=(h.linha%15)+1;
+
+            if(!valvulas[v]) valvulas[v]=[];
+            valvulas[v].push({slot,...h});
+        });
+
+        Object.keys(valvulas).forEach(v=>{
+            let html=`<div class="valvula">
+            <h2>Válvula ${parseInt(v)+1}</h2>
+            <table>
+            <tr><th>Slot</th><th>Liga | Desliga</th><th>Dias</th></tr>`;
+
+            valvulas[v].forEach(h=>{
+                const dias=h.dias.split(",")
+                    .map((v,i)=>v=="1"?diasNome[i]:"")
+                    .filter(Boolean).join(" ");
+
+                html+=`<tr>
+                    <td>${h.slot}</td>
+                    <td>${h.hora_ligar} | ${h.hora_desligar}</td>
+                    <td>${dias||"—"}</td>
+                </tr>`;
+            });
+
+            html+="</table></div>";
+            container.innerHTML+=html;
+        });
+
+        if(container.innerHTML===""){
+            container.innerHTML="<p>Nenhum horário configurado.</p>";
+        }
+    });
+}
+
+// ================= EDITAR HORÁRIO =================
+function editarHorario(){
+    const dias=[0,0,0,0,0,0,0];
+    document.querySelectorAll(".dia").forEach(cb=>{
+        if(cb.checked) dias[parseInt(cb.value)] = 1;
+    });
+
+    const payload={
+        linha: parseInt(canal.value)*15 + parseInt(slot.value),
+        hora_ligar: parseInt(horaL.value),
+        minuto_ligar: parseInt(minL.value),
+        hora_desligar: parseInt(horaD.value),
+        minuto_desligar: parseInt(minD.value),
+        dias:dias
+    };
+
+    fetch("/api/horarios/editar",{
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        body:JSON.stringify(payload)
+    })
+    .then(r=>r.json())
+    .then(d=>{
+        alert(d.status==="ok"
+            ? "Horário enviado ao ESP32"
+            : "Erro ao enviar horário");
+    });
+}
+
+// ================= LOOP =================
+setInterval(()=>{
+    fetch("/status").then(r=>r.json()).then(d=>estadoLed(d.led));
+    atualizarRegistros();
+    atualizarHorarios();
+},3000);
+</script>
+
+</body>
+</html>

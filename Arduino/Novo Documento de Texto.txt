@@ -1,0 +1,4639 @@
+#include <Wire.h>
+#include <RTClib.h>  // Biblioteca do RTC
+#include <EEPROM.h>   // Biblioteca para EEPROM
+#include <ESPAsyncWebServer.h> // Biblioteca para servidor web assíncrono
+#include <WiFi.h>
+#include <PCF8575.h>
+#include "FS.h"
+#include "SD.h"
+#include "SPI.h"
+#include <ArduinoOTA.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+// --------------------------- Variáveis globais configuráveis fertirrigação  ---
+float atraso_da_pausa = 0.0;
+float atraso_do_retorno = 0.0;
+float valor_minimo = 0.0;
+float valor_maximo = 0.0;
+float minutos_misturando = 0.0;
+
+
+// --- Caminho do arquivo no para configurações das ferti  ---
+const char* configFile = "/config.txt";
+bool relesAutomaticosDesligados = false; // Flag global
+
+// Variável global para armazenar o último minuto registrado
+int ultimoMinutoGravado = -1;
+//-------------------------------------------------------------------------------------
+
+
+  // --- Variáveis globais para controle do misturador ---
+  bool releMisturaLigado = false;
+  unsigned long tempoDesligarMistura = 0; 
+
+
+bool agendamentoNaProximaHora(DateTime agora, int hora, int minuto) {
+  int agTotalMin = hora * 60 + minuto;
+  int agoraTotalMin = agora.hour() * 60 + agora.minute();
+
+  return (agTotalMin >= agoraTotalMin) && (agTotalMin < agoraTotalMin + 60);
+}
+
+// Definiçoes das verificaçoes
+#define MAX_HORARIOS_PRONTO 8
+
+int horariosProntoHora[MAX_HORARIOS_PRONTO];
+int horariosProntoMin[MAX_HORARIOS_PRONTO];
+int totalHorariosPronto = 0;
+/////////////////////////////////////////////////////
+
+
+
+const char* SERVER = "http://192.168.0.6:5000";
+
+#define MAX_AGENDAMENTOS 50
+
+enum TipoDispositivo {
+  RELE_GPIO,
+  RELE_PCF8575_1,
+  RELE_PCF8575_2
+};
+
+struct Rele {
+  TipoDispositivo tipo;
+  int pino;
+};
+
+// --- exemplo: configure aqui conforme seu hardware
+Rele relesAdubo[10] = {
+  { RELE_PCF8575_1,  15 },   // Relé 1 no ESP32 GPIO14
+  { RELE_PCF8575_1,  14 },   // Relé 2 no ESP32 GPIO26
+  { RELE_PCF8575_1, 13 },   // Relé 3 no PCF8575_1 pino 0
+  { RELE_PCF8575_2, 12},   // Relé 4 no PCF8575_1 pino 1
+  { RELE_PCF8575_2, 13 },   // Relé 5 no PCF8575_1 pino 2
+  { RELE_PCF8575_2, 14},   // Relé 7 no PCF8575_2 pino 0
+  { RELE_PCF8575_2, 14 },   // Relé 8 no PCF8575_2 pino 1
+  { RELE_PCF8575_2, 2 },   // Relé 9 no PCF8575_2 pino 2
+  { RELE_PCF8575_2, 3 }    // Relé 10 no PCF8575_2 pino 3
+};
+
+float fatorCalibracao[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}; // Fatores calibráveis
+
+struct AgendamentoFerti {
+  int horaLiga;
+  int minutoLiga;
+  bool diasSemana[7];
+  float adubos[10]; // tempo base
+  int atraso;     // em minutos
+};
+
+int ultimaHora = -1;
+
+AgendamentoFerti agendamentos[MAX_AGENDAMENTOS];
+int totalAgendamentos = 0;
+
+bool relesLigados[10] = {false};
+unsigned long temposDesligamento[10] = {0};
+
+
+bool logado = false;  // Flag que indica se o usuário está logado
+
+// Endereços I2C dos módulos PCF8575
+#define PCF8575_1_ADDRESS 0x20
+#define PCF8575_2_ADDRESS 0x21
+
+
+// Instanciação do objeto PCF8575
+PCF8575 pcf8575_1(PCF8575_1_ADDRESS);
+PCF8575 pcf8575_2(PCF8575_2_ADDRESS);
+
+
+// PCF8575_1 - valores acima de 100
+const int PCF8575_1_P0 = 100;
+const int PCF8575_1_P1 = 101;
+const int PCF8575_1_P2 = 102;
+const int PCF8575_1_P3 = 103;
+const int PCF8575_1_P4 = 104;
+const int PCF8575_1_P5 = 105;
+const int PCF8575_1_P6 = 106;
+const int PCF8575_1_P7 = 107;
+const int PCF8575_1_P8 = 108;
+const int PCF8575_1_P9 = 109;
+const int PCF8575_1_P10 = 110;
+const int PCF8575_1_P11 = 111;
+const int PCF8575_1_P12 = 112;
+const int PCF8575_1_P13 = 113;
+const int PCF8575_1_P14 = 114;
+const int PCF8575_1_P15 = 115;
+
+// PCF8575_2 - valores acima de 200
+const int PCF8575_2_P0 = 200;
+const int PCF8575_2_P1 = 201;
+const int PCF8575_2_P2 = 202;
+const int PCF8575_2_P3 = 203;
+const int PCF8575_2_P4 = 204;
+const int PCF8575_2_P5 = 205;
+const int PCF8575_2_P6 = 206;
+const int PCF8575_2_P7 = 207;
+const int PCF8575_2_P8 = 208;
+const int PCF8575_2_P9 = 209;
+const int PCF8575_2_P10 = 210;
+const int PCF8575_2_P11 = 211;
+const int PCF8575_2_P12 = 212;
+const int PCF8575_2_P13 = 213;
+const int PCF8575_2_P14 = 214;
+const int PCF8575_2_P15 = 215;
+
+
+
+// Ajuste o pino conforme seu módulo SD
+#define CS_PIN 5
+#define SD_CS_PIN 5  // Ajuste para o pino CS do seu hardware
+bool sdCarregadoComSucesso = false; // indica se o SD foi carregado corretamente
+
+
+// Configuração do Access Point
+const char* ssid = "DataFruit_Control";
+const char* password = "D@tafruit";
+
+// Configuração do servidor web
+AsyncWebServer server(80);
+
+#define EEPROM_SIZE 512    // Definição do tamanho da EEPROM
+#define EEPROM_FLAG_ADDR (EEPROM_SIZE - 1)  // Último endereço disponível
+
+
+// Definir os pinos dos relés (24 relés)
+int relePins[32] = {
+  PCF8575_1_P0, PCF8575_1_P1, PCF8575_1_P2, PCF8575_1_P3,
+  PCF8575_1_P4, PCF8575_1_P5, PCF8575_1_P6, PCF8575_1_P7,
+  PCF8575_1_P8, PCF8575_1_P9, PCF8575_1_P10, PCF8575_1_P11,
+  PCF8575_1_P12, PCF8575_1_P13, PCF8575_1_P14, PCF8575_1_P15,
+  PCF8575_2_P0, PCF8575_2_P1, PCF8575_2_P2, PCF8575_2_P3,
+  PCF8575_2_P4, PCF8575_2_P5, PCF8575_2_P6, PCF8575_2_P7,
+  PCF8575_2_P8, PCF8575_2_P9, PCF8575_2_P10, PCF8575_2_P11,
+  PCF8575_2_P12, PCF8575_2_P13, PCF8575_2_P14, PCF8575_2_P15
+};
+
+
+// Estruturas para armazenar horários de ligar e desligar
+struct Horario {
+    int hora;
+    int minuto;
+    bool diasSemana[7];  // true/false para cada dia da semana (domingo = índice 0, sábado = índice 6)
+};
+
+
+
+int estadoRele[32] = {HIGH};  //HIGH
+
+Horario horariosLigar[32][15];
+Horario horariosDesligar[32][15];
+
+#define EEPROM_SIZE 512 
+
+
+// RTC
+RTC_DS3231 rtc;
+
+unsigned long ultimoMinutoVerificado = 0; // funçãao verificar ativar só no segundo 10
+
+///////////////////////////////////////
+//horarios de verificação 
+String horarios[8]; 
+bool irrigacaoAtiva = false;
+
+////////////////////////////////////////
+
+
+
+void setup() {
+  
+    delay(5000);
+    Serial.begin(115200);
+    EEPROM.begin(EEPROM_SIZE);
+    inicializarHorarios();
+    carregarConfigDoSD();
+    Wire.begin();
+    pcf8575_1.begin();
+    pcf8575_2.begin();
+    carregarHorarios();
+
+    
+    // Inicializar os pinos dos relés como saídas e desligá-los
+     for (int i = 0; i < 16; i++) {
+        pcf8575_1.pinMode(i, OUTPUT);
+        pcf8575_1.digitalWrite(i, HIGH); //HIGH
+        pcf8575_2.pinMode(i, OUTPUT);
+        pcf8575_2.digitalWrite(i, HIGH); //HIGH
+    }
+
+
+      //carregar pinos da fertirrigação
+// Inicializa relés GPIO (PCF já foi inicializado antes)
+for (int i = 0; i < 10; i++) {
+  if (relesAdubo[i].tipo == RELE_GPIO) {
+    pinMode(relesAdubo[i].pino, OUTPUT);
+    digitalWrite(relesAdubo[i].pino, HIGH); // desligado
+  } else if (relesAdubo[i].tipo == RELE_PCF8575_1) {
+    pcf8575_1.pinMode(relesAdubo[i].pino, OUTPUT);
+    pcf8575_1.digitalWrite(relesAdubo[i].pino, HIGH);
+  } else if (relesAdubo[i].tipo == RELE_PCF8575_2) {
+    pcf8575_2.pinMode(relesAdubo[i].pino, OUTPUT);
+    pcf8575_2.digitalWrite(relesAdubo[i].pino, HIGH);
+  }
+}
+
+    delay(1000);
+    // Inicializar o RTC
+    if (!rtc.begin()) {
+        Serial.println("Erro ao iniciar RTC.");
+        //while (1);  // Travar se o RTC não for encontrado
+    }
+
+    if (rtc.lostPower()) {
+        Serial.println("RTC perdeu energia. Ajustando o horário.");
+        //rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));  // Ajustar com a data/hora de compilação
+    }
+
+      Serial.println("Inicializando o cartão SD...");
+
+
+// Tentativa de inicializar o cartão SD
+sdCarregadoComSucesso = false;
+int attempts = 0;
+
+while (!sdCarregadoComSucesso && attempts < 5) {
+    if (!SD.begin(SD_CS_PIN)) {
+        Serial.println("Falha ao inicializar o cartão SD. Tentando novamente...");
+        attempts++;
+        delay(500);
+    } else {
+        sdCarregadoComSucesso = true;
+    }
+}
+
+if (!sdCarregadoComSucesso) {
+    Serial.println("Card Mount Failed after multiple attempts.");
+} else {
+    Serial.println("Cartão SD inicializado com sucesso!");
+}
+
+
+
+    
+    EEPROM.begin(512); // Use um tamanho maior se necessário para todos os dados
+
+    // Carregar os horários das fertirrigações________________
+    carregarHorariosDoSD();
+    carregarAgendamentosProximaHora();
+    carregarCalibracaoDoSD();
+    //--------------------------------------------------------
+
+    // Configuração do ponto de acesso
+    WiFi.softAP(ssid, password);
+    Serial.println("Ponto de acesso iniciado.");
+    Serial.print("IP do servidor: ");
+    Serial.println(WiFi.softAPIP());
+
+    //WiFi.mode(WIFI_STA);  // Modo estação
+    conectarWiFi();       // Conectar na rede salva
+
+    // Configura a página web
+    configurarPaginaWeb();
+
+     // Verifica se o flag já está salvo
+    if (EEPROM.read(EEPROM_FLAG_ADDR) != 1) {
+        Serial.println("Primeira inicialização detectada, reiniciando...");
+        EEPROM.write(EEPROM_FLAG_ADDR, 1);  // Marca que já reiniciou uma vez
+        EEPROM.commit();  // Salva na EEPROM
+        delay(1000);
+        ESP.restart();  // Reinicia o ESP32
+    }
+
+
+  if (!SD.begin(5)) { // ou SD.begin(CS_PIN)
+        Serial.println("Falha ao inicializar o cartão SD.");
+        while (true); // trava o código se o SD falhar
+    }
+    Serial.println("Cartão SD inicializado com sucesso.");
+
+
+// Configuração básica OTA
+ArduinoOTA
+  .onStart([]() {
+    Serial.println("Iniciando OTA...");
+  })
+  .onEnd([]() {
+    Serial.println("\nConcluído!");
+  })
+  .onError([](ota_error_t error) {
+    Serial.printf("Erro [%u]\n", error);
+  });
+
+// >>> DEFINA A SENHA AQUI <<<
+ArduinoOTA.setPassword("umasenha");
+
+// Inicializa o serviço OTA
+ArduinoOTA.begin();
+
+Serial.println("OTA pronto. Use a IDE para enviar o firmware OTA.");
+
+
+
+
+
+
+
+}
+
+void loop() {
+    verificarServidor_Controle_Oline();
+  verificarServidor_Dados_dos_horarios();
+
+  ArduinoOTA.handle();
+  DateTime now = rtc.now();
+  DateTime agora = rtc.now(); //Marcado de horas
+
+  gravarUmidadeSD();
+
+  
+    // Lógica para ativar ou desativar os relés no horário configurado
+  for (int i = 0; i < 32; i++) {
+        for (int j = 0; j < 15; j++) {
+            if (horariosLigar[i][j].hora != -1 && horariosLigar[i][j].minuto != -1) {
+                int diaAtual = now.dayOfTheWeek(); // Domingo = 0, Segunda = 1, ...
+
+                if (horariosLigar[i][j].diasSemana[diaAtual] &&
+                    now.hour() == horariosLigar[i][j].hora &&
+                    now.minute() == horariosLigar[i][j].minuto) {
+                    estadoRele[i] = LOW; //LOW
+              
+                if (relePins[i] >= 100 && relePins[i] < 200) {
+                         // PCF8575_1
+                 int pcfPin = relePins[i] - 100;
+                 pcf8575_1.digitalWrite(pcfPin, estadoRele[i]);
+                    } else if (relePins[i] >= 200) {
+                  // PCF8575_2
+                int pcfPin = relePins[i] - 200;
+                 pcf8575_2.digitalWrite(pcfPin, estadoRele[i]);
+                  } else {
+                  // Pino do ESP32 direto (se existir)
+                    digitalWrite(relePins[i], estadoRele[i]);
+                  }
+
+                    chave_mestra_ativar(PCF8575_1_P8);
+                }
+
+                if (horariosDesligar[i][j].diasSemana[diaAtual] &&
+                    now.hour() == horariosDesligar[i][j].hora &&
+                    now.minute() == horariosDesligar[i][j].minuto) {
+                    estadoRele[i] = HIGH; //HIGH
+                  
+                  if (relePins[i] >= 100 && relePins[i] < 200) {
+                   // PCF8575_1
+                    int pcfPin = relePins[i] - 100;
+                    pcf8575_1.digitalWrite(pcfPin, estadoRele[i]);
+                  } else if (relePins[i] >= 200) {
+                    // PCF8575_2
+                     int pcfPin = relePins[i] - 200;
+                         pcf8575_2.digitalWrite(pcfPin, estadoRele[i]);
+                      } else {
+                    // Pino do ESP32 direto (se existir)
+                  digitalWrite(relePins[i], estadoRele[i]);
+                    
+                    }
+
+                    chave_mestra_desativar(PCF8575_1_P8);
+                }
+            }
+        }
+    }
+
+
+
+
+
+int h = now.hour();
+int m = now.minute();
+
+static int ultimaHora = -1;
+static int ultimoMinuto = -1;
+
+if (h == ultimaHora && m == ultimoMinuto) return;
+
+ultimaHora = h;
+ultimoMinuto = m;
+
+char buffer[6];
+sprintf(buffer, "%02d:%02d", h, m);
+String horaAtual = String(buffer);
+
+for (int i = 0; i < 8; i++) {
+
+    if (horarios[i].length() == 5 && horarios[i] == horaAtual) {
+
+        verificarPronto();   // <<< SOMENTE ATUALIZA ESTADO
+    }
+}
+
+
+
+
+
+desligarRelePorUmidade();
+
+
+
+
+
+
+  verificarMistura(agora); // momento de ligar as bombas para listura 
+  if (agora.hour() != ultimaHora) {
+    ultimaHora = agora.hour();
+    carregarAgendamentosProximaHora(); // Atualiza agendamentos das fertis para não estourar memoria ram
+  }
+
+  for (int i = 0; i < totalAgendamentos; i++) {
+    AgendamentoFerti ag = agendamentos[i];
+
+    // Verifica o dia da semana
+    int diaSemana = agora.dayOfTheWeek(); // 0 = domingo, ..., 6 = sábado
+    if (!ag.diasSemana[diaSemana]) continue;
+
+    // Calcula horário com atraso
+    int horaReal = ag.horaLiga;
+    int minutoReal = ag.minutoLiga + ag.atraso;
+
+    if (minutoReal >= 60) {
+      horaReal += minutoReal / 60;
+      minutoReal %= 60;
+    }
+
+  // Se já passou da hora, ignora
+  if (ag.horaLiga > 23 || horaReal > 23) continue;
+
+  if (horaReal == agora.hour() && minutoReal == agora.minute() && agora.second() == 0) {
+    // Ativa os reles conforme os tempos calibrados
+      for (int j = 0; j < 10; j++) {
+        if (ag.adubos[j] > 0 && !relesLigados[j]) {
+          float tempoTotal = ag.adubos[j] * fatorCalibracao[j]; // já é float
+          ligarRele(j);   // <<< substitui digitalWrite(...)
+          relesLigados[j] = true;
+          temposDesligamento[j] = millis() + (unsigned long)(tempoTotal * 1000.0f);
+          Serial.printf("Relé %d ativado por %.2f segundos (base %.2f x fator %.2f)\n",
+              j + 1, tempoTotal, ag.adubos[j], fatorCalibracao[j]);
+        }
+      }
+    }
+  }
+
+  // Desliga os reles que passaram do tempo
+  for (int i = 0; i < 10; i++) {
+    if (relesLigados[i] && millis() >= temposDesligamento[i]) {
+      desligarRele(i);  // <<< substitui digitalWrite(...)
+      relesLigados[i] = false;
+      Serial.printf("Relé %d desligado\n", i + 1);
+    }
+  }
+  delay(100);
+
+
+}
+
+
+bool desligarRelePorUmidade() {
+
+    if (!irrigacaoAtiva) {
+        return false;
+    }
+
+    float umidade1 = lerUmidadeSolo1();
+    if (isnan(umidade1)) return false;
+
+    if (umidade1 > valor_maximo) {
+
+        for (int i = 0; i <= 7; i++) {
+            pcf8575_1.digitalWrite(i, HIGH);
+        }
+
+        chave_mestra_desativar(PCF8575_1_P8);
+
+        irrigacaoAtiva = false;
+
+        Serial.println("[DESLIGAR] Irrigação desligada por umidade alta.");
+
+        return true;
+    }
+
+    return false;
+}
+
+
+
+
+// --- Função para verificar se precisa ligar o misturador ---
+void verificarMistura(DateTime agora) {
+  for (int i = 0; i < totalAgendamentos; i++) {
+    AgendamentoFerti ag = agendamentos[i];
+
+    int diaSemana = agora.dayOfTheWeek();
+    if (!ag.diasSemana[diaSemana]) continue;
+
+    // Calcula horário real do agendamento
+    int horaReal = ag.horaLiga;
+    int minutoReal = ag.minutoLiga + ag.atraso;
+
+    if (minutoReal >= 60) {
+      horaReal += minutoReal / 60;
+      minutoReal %= 60;
+    }
+    if (ag.horaLiga > 23 || horaReal > 23) continue;
+
+    // --- Horário da mistura (antes do ligar) ---
+    int horaMistura = horaReal;
+    int minutoMistura = minutoReal - minutos_misturando;
+
+    if (minutoMistura < 0) {
+      horaMistura -= 1;
+      minutoMistura += 60;
+    }
+
+    // --- Horário que vai desligar o misturador ---
+    int horaDesliga = horaReal;
+    int minutoDesliga = minutoReal;
+
+    // --- Liga o misturador ---
+    if (!releMisturaLigado &&
+        horaMistura == agora.hour() &&
+        minutoMistura == agora.minute() &&
+        agora.second() == 0) {
+      
+      Serial.print("🔄 Ativando relé do misturador (PCF8575_1_P11) - Vai desligar às ");
+      Serial.print(horaDesliga);
+      Serial.print(":");
+      Serial.println(minutoDesliga);
+
+      pcf8575_1.digitalWrite(12, LOW);   // Liga relé
+      releMisturaLigado = true;
+
+      // Define quando desligar (em millis)
+      tempoDesligarMistura = millis() + (unsigned long)(minutos_misturando * 60UL * 1000UL);
+    }
+  }
+
+  // --- Desliga após o tempo de mistura ---
+  if (releMisturaLigado && millis() >= tempoDesligarMistura) {
+    pcf8575_1.digitalWrite(12, HIGH);  // Desliga relé
+    releMisturaLigado = false;
+    Serial.println("✅ Misturador desligado após tempo definido");
+  }
+}
+
+
+bool verificarPronto() {
+
+    DateTime agora = rtc.now();
+    int diaAtual = agora.dayOfTheWeek();
+    bool dentroHorario = false;
+
+    for (int i = 0; i < 32; i++) {
+        for (int j = 0; j < 15; j++) {
+
+            if (horariosLigar[i][j].hora != -1 && 
+                horariosLigar[i][j].minuto != -1 &&
+                horariosLigar[i][j].diasSemana[diaAtual]) {
+
+                int agoraMin = agora.hour() * 60 + agora.minute();
+                int ligarMin = horariosLigar[i][j].hora * 60 + horariosLigar[i][j].minuto - atraso_da_pausa;
+                int desligarMin = horariosDesligar[i][j].hora * 60 + horariosDesligar[i][j].minuto + atraso_do_retorno;
+
+                if (agoraMin >= ligarMin && agoraMin <= desligarMin) {
+                    dentroHorario = true;
+                    break;
+                }
+            }
+        }
+        if (dentroHorario) break;
+    }
+
+
+    // ==========================
+    // DENTRO DO HORÁRIO
+    // ==========================
+    if (dentroHorario) {
+
+        if (!relesAutomaticosDesligados) {
+
+            garantirRelesDesligados();
+            relesAutomaticosDesligados = true;
+
+            irrigacaoAtiva = true;   // <<< mantemos ativo
+
+            return true;
+        }
+
+        return false;
+    }
+
+    // ==========================
+    // FORA DO HORÁRIO
+    // ==========================
+
+    relesAutomaticosDesligados = false;
+
+    // <<< NÃO MEXE MAIS NA FLAG AQUI
+    // irrigacaoAtiva continua verdadeira
+    // quando for ligada por umidade
+
+    controleUmidadeReles();
+
+    return false;
+}
+
+
+
+void garantirRelesDesligados() {
+
+    for (int i = 0; i <= 7; i++) {
+        pcf8575_1.digitalWrite(i, HIGH);
+    }
+
+    chave_mestra_desativar(PCF8575_1_P8);
+
+    Serial.println("Relés automáticos desligados (horário programado)");
+}
+
+
+void controleUmidadeReles() {
+
+    carregarConfigDoSD();
+
+    float umidade1 = lerUmidadeSolo1();
+    float umidade2 = lerUmidadeSolo2();
+    float umidade3 = lerUmidadeSolo3();
+
+    float umidadeMedia = umidade1; // ajuste depois se quiser média real
+
+    DateTime agora = rtc.now();
+
+    Serial.printf("[LIGAR] %02d/%02d/%04d %02d:%02d:%02d; U1=%.2f; U2=%.2f; U3=%.2f; Media=%.2f\n",
+                  agora.day(), agora.month(), agora.year(),
+                  agora.hour(), agora.minute(), agora.second(),
+                  umidade1, umidade2, umidade3, umidadeMedia);
+
+
+    // SOLO SECO → Liga irrigação
+    if (umidadeMedia < valor_minimo) {
+
+        for (int i = 0; i <= 7; i++) {
+            pcf8575_1.digitalWrite(i, LOW);
+        }
+
+        chave_mestra_ativar(PCF8575_1_P8);
+
+        irrigacaoAtiva = true;   // <<< AQUI ESTÁ A CORREÇÃO
+
+        Serial.println("Irrigação ligada por umidade baixa");
+    }
+}
+
+
+
+
+// --- Função para ler e gravar umidade no cartão SD ---
+void gravarUmidadeSD() {
+    // --- Lê sensores ---
+    float u1 = lerUmidadeSolo1();
+    float u2 = lerUmidadeSolo2();
+    float u3 = lerUmidadeSolo3();
+
+    // --- Calcula média ---
+    float media = (u1 + u2 + u3) / 3.0;
+
+    // --- Pega hora atual ---
+    DateTime agora = rtc.now();
+
+    // --- Verifica se é múltiplo de 10 minutos e se não foi gravado ainda ---
+    if (agora.minute() % 1 == 0 && agora.minute() != ultimoMinutoGravado) {
+        ultimoMinutoGravado = agora.minute();
+
+        // --- Abre arquivo SD ---
+        File arquivo = SD.open("/umidade.csv", FILE_APPEND);
+        if (arquivo) {
+            // Formato: DATA;HORA;U1;U2;U3;MEDIA
+            arquivo.printf("%02d/%02d/%04d;%02d:%02d:%02d;%.2f;%.2f;%.2f;%.2f\n",
+                           agora.day(), agora.month(), agora.year(),
+                           agora.hour(), agora.minute(), agora.second(),
+                           u1, u2, u3, media);
+            arquivo.close();
+            Serial.println("Dados gravados no SD");
+        } else {
+            Serial.println("Erro ao abrir umidade.csv");
+        }
+    }
+
+    // --- Imprime no Serial ---
+    Serial.printf("%02d/%02d/%04d %02d:%02d:%02d;U1=%.2f;U2=%.2f;U3=%.2f;Media=%.2f\n",
+                  agora.day(), agora.month(), agora.year(),
+                  agora.hour(), agora.minute(), agora.second(),
+                  u1, u2, u3, media);
+}
+
+
+
+///// -------------------------------- ativar reles ferti ------------------------------------
+void ligarRele(int idx) {
+  switch (relesAdubo[idx].tipo) {
+    case RELE_GPIO:
+      digitalWrite(relesAdubo[idx].pino, LOW);
+      break;
+    case RELE_PCF8575_1:
+      pcf8575_1.digitalWrite(relesAdubo[idx].pino, LOW);
+      break;
+    case RELE_PCF8575_2:
+      pcf8575_2.digitalWrite(relesAdubo[idx].pino, LOW);
+      break;
+  }
+}
+
+void desligarRele(int idx) {
+  switch (relesAdubo[idx].tipo) {
+    case RELE_GPIO:
+      digitalWrite(relesAdubo[idx].pino, HIGH);
+      break;
+    case RELE_PCF8575_1:
+      pcf8575_1.digitalWrite(relesAdubo[idx].pino, HIGH);
+      break;
+    case RELE_PCF8575_2:
+      pcf8575_2.digitalWrite(relesAdubo[idx].pino, HIGH);
+      break;
+  }
+}
+
+
+
+
+
+
+float lerUmidadeSolo1() {
+  // Calibração
+  const int valorAr        = 1188;
+  const int valorSeco      = 1397;
+  const int valorUmido     = 1957;
+  const int valorSaturado  = 2548;
+  const int valorAgua      = 2975;
+
+  const int calculoAr        = -1;
+  const int calculoSeco      = 0;
+  const int calculoUmido     = 1026;
+  const int calculoSaturado  = 1753;
+  const int calculoAgua      = 10000;
+
+  // Filtro
+  const float alpha = 0.1;              // Peso do filtro EMA
+  const int amostras = 20;              // Média de cada ciclo
+  const int descartes = 200;            // Quantidade de ciclos descartados
+
+  static float leitura_filtrada = 0;
+  static bool iniciado = false;
+
+  long acumulada = 0;
+  int leitura_media = 0;
+
+  // Descarte inicial
+  if (!iniciado) {
+    for (int i = 0; i < descartes; i++) {
+      acumulada = 0;
+      for (int j = 0; j < amostras; j++) {
+        acumulada += analogRead(35);
+        delayMicroseconds(100);
+      }
+      leitura_media = acumulada / amostras;
+      leitura_media = abs(leitura_media - 4095);
+
+      leitura_filtrada = alpha * leitura_media + (1 - alpha) * leitura_filtrada;
+    }
+    iniciado = true;
+  }
+
+  // Leitura normal com filtragem contínua
+  acumulada = 0;
+  for (int i = 0; i < amostras; i++) {
+    acumulada += analogRead(35);
+    delayMicroseconds(100);
+  }
+  leitura_media = acumulada / amostras;
+  leitura_media = abs(leitura_media - 4095);
+
+  leitura_filtrada = alpha * leitura_media + (1 - alpha) * leitura_filtrada;
+
+  float leitura = leitura_filtrada;
+  float umidade;
+
+  // Conversão para a escala customizada
+  if (leitura < valorSeco) {
+    umidade = -1;
+  }
+  else if (leitura >= valorSeco && leitura <= valorUmido) {
+    umidade = map(leitura, valorSeco, valorUmido, calculoSeco, calculoUmido);
+  }
+  else if (leitura > valorUmido && leitura <= valorSaturado) {
+    umidade = map(leitura, valorUmido, valorSaturado, calculoUmido, calculoSaturado);
+  }
+  else if (leitura > valorSaturado && leitura <= valorAgua) {
+    umidade = map(leitura, valorSaturado, valorAgua, calculoSaturado, calculoAgua);
+  }
+  else {
+    umidade = calculoAgua;
+  }
+
+  return umidade / 100.0;
+}
+
+
+float lerUmidadeSolo2() {
+  // Calibração do sensor 2
+  const int valorAr        = 1280;
+  const int valorSeco      = 1503;
+  const int valorUmido     = 2001;
+  const int valorSaturado  = 2805;
+  const int valorAgua      = 3055;
+
+  const int calculoAr        = -1;
+  const int calculoSeco      = 0;
+  const int calculoUmido     = 1026;
+  const int calculoSaturado  = 1753;
+  const int calculoAgua      = 10000;
+
+  // Parâmetros do filtro
+  const float alpha = 0.1;
+  const int amostras = 20;
+  const int descartes = 200;
+
+  // Estado do filtro deste sensor (independente do sensor 1)
+  static float leitura_filtrada = 0;
+  static bool iniciado = false;
+
+  long acumulada = 0;
+  int leitura_media = 0;
+
+  // Descarte inicial
+  if (!iniciado) {
+    for (int i = 0; i < descartes; i++) {
+      acumulada = 0;
+      for (int j = 0; j < amostras; j++) {
+        acumulada += analogRead(32);
+        delayMicroseconds(100);
+      }
+      leitura_media = acumulada / amostras;
+      leitura_media = abs(leitura_media - 4095);
+
+      leitura_filtrada = alpha * leitura_media + (1 - alpha) * leitura_filtrada;
+    }
+    iniciado = true;
+  }
+
+  // Leitura contínua filtrada
+  acumulada = 0;
+  for (int i = 0; i < amostras; i++) {
+    acumulada += analogRead(32);
+    delayMicroseconds(100);
+  }
+  leitura_media = acumulada / amostras;
+  leitura_media = abs(leitura_media - 4095);
+
+  leitura_filtrada = alpha * leitura_media + (1 - alpha) * leitura_filtrada;
+
+  float leitura = leitura_filtrada;
+  float umidade;
+
+  // Conversão para valor final
+  if (leitura < valorSeco) {
+    umidade = -1;
+  }
+  else if (leitura >= valorSeco && leitura <= valorUmido) {
+    umidade = map(leitura, valorSeco, valorUmido, calculoSeco, calculoUmido);
+  }
+  else if (leitura > valorUmido && leitura <= valorSaturado) {
+    umidade = map(leitura, valorUmido, valorSaturado, calculoUmido, calculoSaturado);
+  }
+  else if (leitura > valorSaturado && leitura <= valorAgua) {
+    umidade = map(leitura, valorSaturado, valorAgua, calculoSaturado, calculoAgua);
+  }
+  else {
+    umidade = calculoAgua;
+  }
+
+  return umidade / 100.0;
+}
+
+
+
+float lerUmidadeSolo3() {
+  // Calibração do sensor 3
+  const int valorAr        = 1341;
+  const int valorSeco      = 1581;
+  const int valorUmido     = 2037;
+  const int valorSaturado  = 2733;
+  const int valorAgua      = 3080;
+
+  const int calculoAr        = -1;
+  const int calculoSeco      = 0;
+  const int calculoUmido     = 1026;
+  const int calculoSaturado  = 1753;
+  const int calculoAgua      = 10000;
+
+  // Parâmetros do filtro
+  const float alpha = 0.1;
+  const int amostras = 20;
+  const int descartes = 200;
+
+  // Estado do filtro deste sensor (independente dos outros)
+  static float leitura_filtrada = 0;
+  static bool iniciado = false;
+
+  long acumulada = 0;
+  int leitura_media = 0;
+
+  // Descarte inicial de leituras
+  if (!iniciado) {
+    for (int i = 0; i < descartes; i++) {
+      acumulada = 0;
+      for (int j = 0; j < amostras; j++) {
+        acumulada += analogRead(33);
+        delayMicroseconds(100);
+      }
+      leitura_media = acumulada / amostras;
+      leitura_media = abs(leitura_media - 4095);
+
+      leitura_filtrada = alpha * leitura_media + (1 - alpha) * leitura_filtrada;
+    }
+    iniciado = true;
+  }
+
+  // Leitura contínua filtrada
+  acumulada = 0;
+  for (int i = 0; i < amostras; i++) {
+    acumulada += analogRead(33);
+    delayMicroseconds(100);
+  }
+  leitura_media = acumulada / amostras;
+  leitura_media = abs(leitura_media - 4095);
+
+  leitura_filtrada = alpha * leitura_media + (1 - alpha) * leitura_filtrada;
+
+  float leitura = leitura_filtrada;
+  float umidade;
+
+  // Conversão do sinal filtrado para umidade
+  if (leitura < valorSeco) {
+    umidade = -1;
+  }
+  else if (leitura >= valorSeco && leitura <= valorUmido) {
+    umidade = map(leitura, valorSeco, valorUmido, calculoSeco, calculoUmido);
+  }
+  else if (leitura > valorUmido && leitura <= valorSaturado) {
+    umidade = map(leitura, valorUmido, valorSaturado, calculoUmido, calculoSaturado);
+  }
+  else if (leitura > valorSaturado && leitura <= valorAgua) {
+    umidade = map(leitura, valorSaturado, valorAgua, calculoSaturado, calculoAgua);
+  }
+  else {
+    umidade = calculoAgua;
+  }
+
+  return umidade / 100.0;
+}
+
+
+
+float lerUmidadeSolo4() {
+// --- Valores de calibração do sensor (entrada) ---
+int valorAr        = 1341;
+int valorSeco      = 1581;
+int valorUmido     = 2037;
+int valorSaturado  = 2733;
+int valorAgua      = 3080;
+
+// --- Valores de saída mapeados (percentual ou escala customizada) ---
+int calculoAr        = -1;
+int calculoSeco      = 0;
+int calculoUmido     = 1026;
+int calculoSaturado  = 1753;
+int calculoAgua      = 10000;
+
+  // --- Média de leituras ---
+  int amostras = 100;
+  long acumulada = 0;
+  for (int i = 0; i < amostras; i++) {
+    acumulada += analogRead(35);
+  }
+  int media = acumulada / amostras;
+
+  // --- Inverte a leitura (opcional, depende do sensor) ---
+  int leitura = abs(media - 4095); // - 4095
+
+float umidade;
+
+if (leitura < valorSeco) {
+  // Menor que o solo seco → retorna -1
+  umidade = -1;
+}
+else if (leitura >= valorSeco && leitura <= valorUmido) {
+  // Entre seco e úmido
+  umidade = map(leitura, valorSeco, valorUmido, calculoSeco, calculoUmido);
+}
+else if (leitura > valorUmido && leitura <= valorSaturado) {
+  // Entre úmido e saturado
+  umidade = map(leitura, valorUmido, valorSaturado, calculoUmido, calculoSaturado);
+}
+else if (leitura > valorSaturado && leitura <= valorAgua) {
+  // Entre saturado e água
+  umidade = map(leitura, valorSaturado, valorAgua, calculoSaturado, calculoAgua);
+}
+else {
+  // Maior que água → trava no valor máximo
+  umidade = calculoAgua;
+}
+
+  return umidade / 100.00;
+}
+
+
+
+float lerUmidadeSolo5() {
+// --- Valores de calibração do sensor (entrada) ---
+int valorAr        = 1341;
+int valorSeco      = 1581;
+int valorUmido     = 2037;
+int valorSaturado  = 2733;
+int valorAgua      = 3080;
+
+// --- Valores de saída mapeados (percentual ou escala customizada) ---
+int calculoAr        = -1;
+int calculoSeco      = 0;
+int calculoUmido     = 1026;
+int calculoSaturado  = 1753;
+int calculoAgua      = 10000;
+
+  // --- Média de leituras ---
+  int amostras = 100;
+  long acumulada = 0;
+  for (int i = 0; i < amostras; i++) {
+    acumulada += analogRead(15);
+  }
+  int media = acumulada / amostras;
+
+  // --- Inverte a leitura (opcional, depende do sensor) ---
+  int leitura = abs(media - 4095); // - 4095
+
+float umidade;
+
+if (leitura < valorSeco) {
+  // Menor que o solo seco → retorna -1
+  umidade = -1;
+}
+else if (leitura >= valorSeco && leitura <= valorUmido) {
+  // Entre seco e úmido
+  umidade = map(leitura, valorSeco, valorUmido, calculoSeco, calculoUmido);
+}
+else if (leitura > valorUmido && leitura <= valorSaturado) {
+  // Entre úmido e saturado
+  umidade = map(leitura, valorUmido, valorSaturado, calculoUmido, calculoSaturado);
+}
+else if (leitura > valorSaturado && leitura <= valorAgua) {
+  // Entre saturado e água
+  umidade = map(leitura, valorSaturado, valorAgua, calculoSaturado, calculoAgua);
+}
+else {
+  // Maior que água → trava no valor máximo
+  umidade = calculoAgua;
+}
+
+  return umidade / 100.00;
+}
+
+
+
+///// -------------------------------- ativar reles ferti ------------------------------------
+// --- Função para salvar parâmetros no SD ---
+void salvarConfig() {
+  File file = SD.open(configFile, FILE_WRITE);
+  if (file) {
+    file.printf("%d,%d,%d,%d,%d\n", 
+                atraso_da_pausa, 
+                atraso_do_retorno, 
+                valor_minimo, 
+                valor_maximo, 
+                minutos_misturando);
+    file.close();
+    Serial.println("Configuração salva no SD!");
+  } else {
+    Serial.println("Erro ao salvar configuração.");
+  }
+}
+
+// --- Função para carregar parâmetros do SD ---
+void carregarConfig() {
+  if (!SD.exists(configFile)) {
+    salvarConfig(); // cria com valores padrão
+    return;
+  } 
+  File file = SD.open(configFile, FILE_READ);
+  if (file) {
+    String linha = file.readStringUntil('\n');
+    sscanf(linha.c_str(), "%d,%d,%d,%d,%d", 
+           &atraso_da_pausa, 
+           &atraso_do_retorno, 
+           &valor_minimo, 
+           &valor_maximo, 
+           &minutos_misturando);
+    file.close();
+    Serial.println("Configuração carregada do SD!");
+  } else {
+    Serial.println("Erro ao abrir configuração.");
+  }
+}
+
+
+
+
+
+
+// ==========================
+// FUNÇÃO PARA SALVAR NO SD
+// ==========================
+void salvarConfigNoSD() {
+  SD.remove("/config.txt");
+  File arquivo = SD.open("/config.txt", FILE_WRITE);
+  if (arquivo) {
+    arquivo.printf("%.2f,%.2f,%.2f,%.2f,%.2f\n",
+                   atraso_da_pausa,
+                   atraso_do_retorno,
+                   valor_minimo,
+                   valor_maximo,
+                   minutos_misturando);
+    arquivo.close();
+    Serial.println("Config salva no SD.");
+  } else {
+    Serial.println("Erro ao salvar no SD!");
+  }
+}
+
+
+// ==========================
+// FUNÇÃO PARA LER DO SD
+// ==========================
+void carregarConfigDoSD() {
+  if (!SD.exists("/config.txt")) {
+    Serial.println("Arquivo config.txt não existe!");
+    return;
+  }
+
+  File arquivo = SD.open("/config.txt", FILE_READ);
+  if (arquivo) {
+    String linha = arquivo.readStringUntil('\n');
+    arquivo.close();
+
+    float valores[5];
+    int idx = 0;
+    int lastIdx = 0;
+    for (int i = 0; i <= linha.length(); i++) {
+      if (linha[i] == ',' || i == linha.length()) {
+        valores[idx++] = linha.substring(lastIdx, i).toFloat();
+        lastIdx = i + 1;
+      }
+    }
+
+    if (idx == 5) {
+      atraso_da_pausa = valores[0];
+      atraso_do_retorno = valores[1];
+      valor_minimo = valores[2];
+      valor_maximo = valores[3];
+      minutos_misturando = valores[4];
+    }
+  }
+}
+
+
+
+
+
+//carregar agendamento 
+void splitLinha(String linha, String partes[], int maxPartes) {
+  int pos = 0, lastIndex = 0, count = 0;
+  while ((pos = linha.indexOf(',', lastIndex)) != -1 && count < maxPartes - 1) {
+    partes[count++] = linha.substring(lastIndex, pos);
+    lastIndex = pos + 1;
+  }
+  partes[count] = linha.substring(lastIndex);
+}
+
+
+
+void carregarAgendamentosProximaHora() {
+  File arquivo = SD.open("/ferti1.txt");
+  if (!arquivo) {
+    Serial.println("Erro ao abrir ferti1.txt");
+    return;
+  }
+
+  DateTime agora = rtc.now();
+  totalAgendamentos = 0;
+
+  while (arquivo.available() && totalAgendamentos < MAX_AGENDAMENTOS) {
+    String linha = arquivo.readStringUntil('\n');
+    linha.trim();
+    if (linha.length() == 0) continue;
+
+    String partes[30];
+    splitLinha(linha, partes, 30);
+
+    int hora = partes[2].toInt();
+    int minuto = partes[3].toInt();
+    int atraso = partes[23].toInt();
+
+    int horaReal = hora;
+    int minutoReal = minuto + atraso;
+    if (minutoReal >= 60) {
+      horaReal += minutoReal / 60;
+      minutoReal %= 60;
+    }
+
+    if (!agendamentoNaProximaHora(agora, horaReal, minutoReal)) continue;
+
+    AgendamentoFerti ag;
+    ag.horaLiga = hora;
+    ag.minutoLiga = minuto;
+    ag.atraso = atraso;
+
+    for (int i = 0; i < 7; i++) {
+      ag.diasSemana[i] = partes[6 + i].toInt() == 1;
+    }
+
+    for (int i = 0; i < 10; i++) {
+      ag.adubos[i] = partes[13 + i].toFloat(); // antes era .toInt()
+    }
+
+
+    agendamentos[totalAgendamentos++] = ag;
+  }
+
+  arquivo.close();
+  Serial.println("Agendamentos carregados: " + String(totalAgendamentos));
+}
+
+
+
+
+//Carregar calibração 
+void carregarCalibracaoDoSD() {
+  File file = SD.open("/calibracao.txt");
+  if (file) {
+    int i = 0;
+    while (file.available() && i < 10) {
+      fatorCalibracao[i] = file.readStringUntil('\n').toFloat();
+      i++;
+    }
+    file.close();
+    Serial.println("Fatores de calibração carregados do SD.");
+  } else {
+    Serial.println("Arquivo de calibração não encontrado no SD.");
+  }
+}
+
+
+
+
+
+void carregarNomesFertilizantesDoSD(String nomes[10]) {
+  if (!SD.exists("/nomes_fert.txt")) {
+    for (int i = 0; i < 10; i++) nomes[i] = "";
+    return;
+  }
+
+  File file = SD.open("/nomes_fert.txt", FILE_READ);
+  if (!file) {
+    for (int i = 0; i < 10; i++) nomes[i] = "";
+    return;
+  }
+
+  int i = 0;
+  while (file.available() && i < 10) {
+    nomes[i] = file.readStringUntil('\n');
+    nomes[i].trim(); // Remove espaços e quebras de linha extras
+    i++;
+  }
+
+  // Se tiver menos que 10 nomes, preenche os restantes com string vazia
+  for (; i < 10; i++) {
+    nomes[i] = "";
+  }
+
+  file.close();
+}
+
+
+void apagarLinhaHorario(int rele, int horario) {
+  File file = SD.open("/ferti1.txt", FILE_READ);
+  if (!file) {
+    Serial.println("Erro ao abrir ferti1.txt para leitura.");
+    return;
+  }
+
+  String linhasAtualizadas = "";
+  bool apagou = false;
+
+  while (file.available()) {
+    String linha = file.readStringUntil('\n');
+    linha.trim();
+    if (linha.length() == 0) continue;
+
+    // Pega os dois primeiros campos (relé e horário)
+    int r = linha.substring(0, linha.indexOf(',')).toInt();
+    int h = linha.substring(linha.indexOf(',') + 1, linha.indexOf(',', linha.indexOf(',') + 1)).toInt();
+
+    if (r == rele + 1 && h == horario + 1) {
+      // Ignora essa linha (ou seja, apaga)
+      apagou = true;
+      continue;
+    }
+
+    // Mantém as demais linhas
+    linhasAtualizadas += linha + "\n";
+  }
+  file.close();
+
+  // Reescreve o arquivo sem a linha apagada
+  file = SD.open("/ferti1.txt", FILE_WRITE);
+  if (!file) {
+    Serial.println("Erro ao abrir ferti1.txt para reescrita.");
+    return;
+  }
+  file.print(linhasAtualizadas);
+  file.close();
+
+  if (apagou) {
+    Serial.println("Horário apagado com sucesso!");
+  } else {
+    Serial.println("Nenhum horário encontrado para apagar.");
+  }
+}
+
+
+void salvarHorariosNoSD() {
+    File file = SD.open("/horarios.txt", FILE_WRITE);
+
+    if (file) {
+        for (int i = 0; i < 32; i++) {
+            for (int j = 0; j < 15; j++) {
+                file.print(horariosLigar[i][j].hora);
+                file.print(",");
+                file.print(horariosLigar[i][j].minuto);
+                file.print(",");
+                file.print(horariosDesligar[i][j].hora);
+                file.print(",");
+                file.print(horariosDesligar[i][j].minuto);
+                
+                for (int d = 0; d < 7; d++) {
+                    file.print(",");
+                    file.print(horariosLigar[i][j].diasSemana[d] ? (d + 1) : 0); // Salva dia da semana como 1 a 7 ou 0
+                }
+                file.println();
+            }
+        }
+        file.close();
+        Serial.println("Horários salvos no cartão SD com sucesso!");
+    } else {
+        Serial.println("Erro ao abrir o arquivo para salvar!");
+    }
+}
+
+
+
+
+void carregarHorariosDoSD() {
+    File file = SD.open("/horarios.txt");
+
+    if (file) {
+        int i = 0, j = 0;
+        while (file.available()) {
+            String line = file.readStringUntil('\n');
+            int hora, minuto, horaDesliga, minutoDesliga;
+            int dias[7] = {0};
+
+            sscanf(line.c_str(), "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d", 
+                   &hora, &minuto, &horaDesliga, &minutoDesliga, 
+                   &dias[0], &dias[1], &dias[2], &dias[3], &dias[4], &dias[5], &dias[6]);
+
+            horariosLigar[i][j].hora = hora;
+            horariosLigar[i][j].minuto = minuto;
+            horariosDesligar[i][j].hora = horaDesliga;
+            horariosDesligar[i][j].minuto = minutoDesliga;
+
+            // Atualiza os dias da semana
+            for (int d = 0; d < 7; d++) {
+                horariosLigar[i][j].diasSemana[d] = (dias[d] > 0);
+                horariosDesligar[i][j].diasSemana[d] = (dias[d] > 0);
+            }
+
+            j++;
+            if (j >= 15) {
+                j = 0;
+                i++;
+            }
+        }
+        file.close();
+        Serial.println("Horários carregados do cartão SD com sucesso!");
+    } else {
+        Serial.println("Erro ao abrir o arquivo para carregar!");
+    }
+}
+
+
+
+void apagarConfiguracaoRele(int releEscolhido) {
+    releEscolhido -= 1; // Ajustar para o índice do array
+
+    if (releEscolhido >= 0 && releEscolhido < 32) {
+        // Limpar na memória RAM
+        for (int j = 0; j < 15; j++) {
+            horariosLigar[releEscolhido][j] = { -1, -1, {false, false, false, false, false, false, false} };
+            horariosDesligar[releEscolhido][j] = { -1, -1, {false, false, false, false, false, false, false} };
+        }
+
+        // Função auxiliar para apagar em um arquivo
+        auto apagarNoArquivo = [&](const char* path) {
+            File file = SD.open(path, FILE_READ);
+            if (file) {
+                String fileContent = "";
+                while (file.available()) {
+                    fileContent += file.readStringUntil('\n') + "\n";
+                }
+                file.close();
+
+                String newContent = "";
+                int lineNum = releEscolhido * 15; // Cada relé tem 15 horários
+                int lineCount = 0;
+                int pos = 0;
+
+                while (pos < fileContent.length()) {
+                    int endPos = fileContent.indexOf('\n', pos);
+                    if (endPos == -1) endPos = fileContent.length();
+                    String line = fileContent.substring(pos, endPos);
+                    if (lineCount < lineNum || lineCount >= lineNum + 15) {
+                        newContent += line + "\n";
+                    }
+                    pos = endPos + 1;
+                    lineCount++;
+                }
+
+                file = SD.open(path, FILE_WRITE);
+                if (file) {
+                    file.print(newContent);
+                    file.close();
+                }
+            }
+        };
+
+        // Apagar em ambos os arquivos
+        apagarNoArquivo("/horarios.txt");
+        apagarNoArquivo("/horarios_backup.txt");
+
+        // Apagar configurações da EEPROM
+        int endereco = releEscolhido * 32;
+        for (int i = 0; i < 32; i++) {
+            EEPROM.write(endereco + i, 0xFF);
+        }
+        EEPROM.commit();
+
+        Serial.print("Configurações do relé ");
+        Serial.print(releEscolhido + 1);
+        Serial.println(" apagadas com sucesso dos arquivos e da EEPROM.");
+    }
+}
+
+
+void inicializarHorarios() {
+    for (int i = 0; i < 32; i++) {
+        for (int j = 0; j < 15; j++) {
+            horariosLigar[i][j] = { -1, -1, {false, false, false, false, false, false, false} };
+            horariosDesligar[i][j] = { -1, -1, {false, false, false, false, false, false, false} };
+        }
+    }
+}
+
+
+void configurarDiasSemana(int releEscolhido, int horarioEscolhido) {
+    Serial.println("Digite os dias da semana separados por vírgula (1 = domingo, 7 = sábado):");
+    while (!Serial.available()) {}
+    String diasSemana = Serial.readStringUntil('\n');
+    diasSemana.trim();
+
+    for (int d = 0; d < 7; d++) {
+        horariosLigar[releEscolhido][horarioEscolhido].diasSemana[d] = false;
+        horariosDesligar[releEscolhido][horarioEscolhido].diasSemana[d] = false;
+    }
+
+    int pos = 0;
+    while ((pos = diasSemana.indexOf(',')) != -1) {
+        int dia = diasSemana.substring(0, pos).toInt() - 1;
+        if (dia >= 0 && dia < 7) {
+            horariosLigar[releEscolhido][horarioEscolhido].diasSemana[dia] = true;
+            horariosDesligar[releEscolhido][horarioEscolhido].diasSemana[dia] = true;
+        }
+        diasSemana = diasSemana.substring(pos + 1);
+    }
+    int dia = diasSemana.toInt() - 1;
+    if (dia >= 0 && dia < 7) {
+        horariosLigar[releEscolhido][horarioEscolhido].diasSemana[dia] = true;
+        horariosDesligar[releEscolhido][horarioEscolhido].diasSemana[dia] = true;
+    }
+    Serial.println("Configuração de dias salva!");
+}
+
+
+void mostrarDataCompleta() {
+    DateTime agora = rtc.now();  // Obtém a data e hora atuais do RTC
+
+    // Array com os dias da semana
+    const char* diasSemana[] = {"Domingo", "Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira", "Sexta-feira", "Sábado"};
+
+    // Obtém o índice do dia da semana (1 = domingo, 7 = sábado)
+    int indiceDiaSemana = agora.dayOfTheWeek();
+
+    // Exibe a data completa e o dia da semana
+    Serial.print("Data: ");
+    Serial.print(agora.day());
+    Serial.print("/");
+    Serial.print(agora.month());
+    Serial.print("/");
+    Serial.print(agora.year());
+    Serial.print(" - Dia da semana: ");
+    Serial.println(diasSemana[indiceDiaSemana]);
+}
+
+
+void salvarNomesRelesNoSD(String nomesReles[32]) {
+    // Abre o arquivo original para leitura
+    File file = SD.open("/nomes_reles.txt", FILE_READ);
+    String nomes[32]; // Array para armazenar os nomes atuais no arquivo
+    int i = 0;
+
+    // Lê os nomes já salvos no arquivo
+    if (file) {
+        while (file.available() && i < 32) {
+            nomes[i] = file.readStringUntil('\n');
+            nomes[i].trim();  // Remove espaços extras e quebras de linha
+            i++;
+        }
+        file.close();
+    }
+
+    // Atualiza apenas os nomes que foram recebidos na requisição
+    for (int j = 0; j < 32; j++) {
+        if (nomesReles[j].length() > 0) { // Se um nome foi passado, atualiza
+            nomes[j] = nomesReles[j];
+        }
+    }
+
+    // Reabre o arquivo para escrita e sobrescreve os nomes
+    file = SD.open("/nomes_reles.txt", FILE_WRITE);
+    if (file) {
+        for (int j = 0; j < 32; j++) {
+            file.println(nomes[j]);
+        }
+        file.close();
+    } else {
+        Serial.println("Erro ao abrir o arquivo para salvar os nomes.");
+    }
+}
+
+
+void carregarNomesRelesDoSD(String nomesReles[32]) {
+    File arquivo = SD.open("/nomes_reles.txt", FILE_READ);
+    if (arquivo) {
+        for (int i = 0; i < 32; i++) {
+            if (arquivo.available()) {
+                nomesReles[i] = arquivo.readStringUntil('\n');
+                nomesReles[i].trim();  // Remove espaços extras
+            }
+        }
+        arquivo.close();
+    } else {
+        Serial.println("Erro ao abrir o arquivo para ler os nomes.");
+    }
+}
+
+
+
+void removeNomeDoRele(int releIndex) {
+    // Lógica para abrir o arquivo de nomes no cartão SD e limpar o nome do relé
+    File file = SD.open("/nomes_reles.txt", FILE_READ);
+    if (file) {
+        String nomes[32];
+        int i = 0;
+        while (file.available()) {
+            nomes[i] = file.readStringUntil('\n');
+            i++;
+        }
+        file.close();
+
+        // Limpa o nome do relé selecionado
+        nomes[releIndex] = "";
+
+        // Reabre o arquivo para sobrescrever os nomes
+        file = SD.open("/nomes_reles.txt", FILE_WRITE);
+        if (file) {
+            for (int j = 0; j < 32; j++) {
+                file.println(nomes[j]);
+            }
+            file.close();
+        }
+    }
+}
+
+void atualizarNomeDoRele(int releIndex, String novoNome) {
+    File file = SD.open("/nomes_reles.txt", FILE_READ);
+    String nomes[32];
+    int i = 0;
+
+    // Lê os nomes atuais do arquivo
+    if (file) {
+        while (file.available() && i < 32) {
+            nomes[i] = file.readStringUntil('\n');
+            nomes[i].trim();
+            i++;
+        }
+        file.close();
+    }
+
+    // Atualiza o nome do relé selecionado
+    nomes[releIndex] = novoNome;
+
+    // Reabre o arquivo para sobrescrever com os novos dados
+    file = SD.open("/nomes_reles.txt", FILE_WRITE);
+    if (file) {
+        for (int j = 0; j < 32; j++) {
+            file.println(nomes[j]);
+        }
+        file.close();
+    } else {
+        Serial.println("Erro ao abrir o arquivo para salvar o nome.");
+    }
+}
+
+
+
+void salvarWiFiNaEEPROM(String ssid, String password) {
+    EEPROM.begin(EEPROM_SIZE);
+    Serial.println("Salvando credenciais na EEPROM...");
+
+    for (int i = 0; i < 32; i++) EEPROM.write(i, i < ssid.length() ? ssid[i] : 0);
+    for (int i = 0; i < 64; i++) EEPROM.write(32 + i, i < password.length() ? password[i] : 0);
+
+    EEPROM.commit();
+    Serial.println("Credenciais salvas!");
+}
+
+void carregarWiFiDaEEPROM(String &ssid, String &password) {
+    EEPROM.begin(EEPROM_SIZE);
+
+    char ssid_c[32], password_c[64];
+    for (int i = 0; i < 32; i++) ssid_c[i] = EEPROM.read(i);
+    for (int i = 0; i < 64; i++) password_c[i] = EEPROM.read(32 + i);
+
+    ssid = String(ssid_c).c_str();
+    password = String(password_c).c_str();
+}
+
+void conectarWiFi() {
+    String ssid, password;
+    carregarWiFiDaEEPROM(ssid, password);
+
+    WiFi.mode(WIFI_AP_STA);  // Modo simultâneo (STA + AP)
+    WiFi.softAP("DataFruit_Control", "D@tafruit"); // Mantém o AP sempre ativo
+
+    if (ssid.length() > 0 && password.length() > 0) {
+        Serial.println("Conectando à rede salva: " + ssid);
+        WiFi.begin(ssid.c_str(), password.c_str());
+
+        int tentativas = 0;
+        while (WiFi.status() != WL_CONNECTED && tentativas < 20) {
+            delay(500);
+            Serial.print(".");
+            tentativas++;
+        }
+
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println("\nConectado com sucesso!");
+            Serial.print("IP Local: ");
+            Serial.println(WiFi.localIP());
+        } else {
+            Serial.println("\nFalha ao conectar. Apenas modo AP ativo.");
+        }
+    } else {
+        Serial.println("Nenhuma rede salva. Apenas modo AP ativo.");
+    }
+}
+
+
+
+void apagarWiFiDaEEPROM() {
+    EEPROM.begin(EEPROM_SIZE);
+    for (int i = 0; i < 96; i++) EEPROM.write(i, 0);
+    EEPROM.commit();
+}
+
+
+// Função para salvar os dados no cartão SD
+void salvarDadosNoSD() {
+  File arquivo = SD.open("/configuracoes.txt", FILE_WRITE);
+  if (arquivo) {
+    for (int i = 0; i < 32; i++) {
+      for (int j = 0; j < 15; j++) {
+        arquivo.print(horariosLigar[i][j].hora);
+        arquivo.print(":");
+        arquivo.print(horariosLigar[i][j].minuto);
+        arquivo.print(" ");
+        arquivo.print(horariosDesligar[i][j].hora);
+        arquivo.print(":");
+        arquivo.print(horariosDesligar[i][j].minuto);
+        for (int d = 0; d < 7; d++) {
+          arquivo.print(horariosLigar[i][j].diasSemana[d] ? "1" : "0");
+        }
+        arquivo.println();
+      }
+    }
+    arquivo.close();
+  } else {
+    Serial.println("Erro ao abrir o arquivo para salvar!");
+  }
+}
+
+
+
+void configurarPaginaWeb() {
+
+// Rota para servir a imagem do logo
+        server.on("/Vetorizada.png", HTTP_GET, [](AsyncWebServerRequest *request){
+        request->send(SD, "/logo.png", "image/png");
+    });
+
+
+// Página principal - sempre redireciona para a página de login se o usuário não estiver logado
+server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!logado) {
+        request->redirect("/login");  // Redireciona para o login se não estiver logado
+        return;
+    }
+  
+    request->redirect("/principal");  
+});
+
+
+
+// Página de login
+server.on("/login", HTTP_GET, [](AsyncWebServerRequest *request){
+    String html = "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+    html += "<style>";
+    html += "body { font-family: Arial, sans-serif; text-align: center; padding: 20px; background-color: #f4f4f4; }";
+    html += "input { padding: 10px; margin: 10px; font-size: 16px; border-radius: 5px; border: 1px solid #ddd; }";
+    html += "button { padding: 10px 20px; font-size: 16px; background-color: #4CAF50; color: white; border: none; border-radius: 5px; cursor: pointer; }";
+    html += "button:hover { background-color: #45a049; }";
+    html += "img { width: 150px; margin-bottom: 20px; display: block; margin-left: auto; margin-right: auto; }";
+    html += "</style></head><body>";
+
+    html += "<img src='/Vetorizada.png' alt='Logo'>";  // <- Logo aqui
+    html += "<h1>Login</h1>";
+    html += "<form action='/login' method='POST'>";
+    html += "<input type='text' name='username' placeholder='Usuário' required><br>";
+    html += "<input type='password' name='password' placeholder='Senha' required><br>";
+    html += "<button type='submit'>Entrar</button>";
+    html += "</form>";
+    html += "</body></html>";
+    request->send(200, "text/html", html);
+});
+
+// Verifica o login
+server.on("/login", HTTP_POST, [](AsyncWebServerRequest *request){
+    String username;
+    String password;
+
+    if (request->hasParam("username", true)) {
+        username = request->getParam("username", true)->value();
+    }
+    if (request->hasParam("password", true)) {
+        password = request->getParam("password", true)->value();
+    }
+
+    // Aqui você pode verificar o login, vou usar usuário e senha fixos para este exemplo
+    if (username == "admin" && password == "senha123") {
+        logado = true;
+        request->redirect("/principal");  // Redireciona para a página de configurações após login
+    } else {
+        request->send(200, "text/html", "<html><body><h2>Login falhou. Tente novamente.</h2><a href='/login'>Voltar</a></body></html>");
+    }
+});
+
+
+
+
+    // Página principal - só acessível se o usuário estiver logado
+    server.on("/principal", HTTP_GET, [](AsyncWebServerRequest *request){
+        if (!logado) {
+            request->redirect("/login");  // Se não estiver logado, redireciona para a página de login
+            return;
+        }
+
+
+
+    DateTime now = rtc.now(); // Obtém a hora atual do RTC
+    String diasSemana[] = {"Domingo", "Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado"};
+    String diaDaSemana = diasSemana[now.dayOfTheWeek()]; // Obtém o nome do dia da semana
+
+    String html = "<html><head>";
+    html += "<meta charset='UTF-8'>"; // Definindo a codificação de caracteres UTF-8
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"; // Tornar responsivo
+    html += "<style>";
+    html += "body { font-family: Arial, sans-serif; margin: 0; padding: 0; background-color: #f4f4f4; text-align: center; }";
+    html += "h1 { color: #4CAF50; font-size: 40px; margin: 20px 0; font-weight: bold; }";  // Título maior e em negrito
+    html += "p { font-size: 20px; color: #666; margin: 10px 0; }";
+    html += "a { display: block; padding: 15px; margin: 10px auto; width: 90%; max-width: 350px; background-color: #4CAF50; color: white; text-decoration: none; border-radius: 8px; font-size: 18px; box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2); }";
+    html += "a:hover { background-color: #45a049; }";
+    html += "@media (max-width: 600px) {";
+    html += "a { width: 95%; font-size: 16px; padding: 12px; }"; // Ajuste para dispositivos menores
+    html += "p { font-size: 18px; }"; // Ajuste do tamanho da fonte em dispositivos pequenos
+    html += "h1 { font-size: 32px; }"; // Ajuste do título em dispositivos pequenos
+    html += "body { padding: 10px; }"; // Espaçamento adicional em telas pequenas
+    html += "}"; // Fechando o @media
+    html += "</style>";
+    html += "</head><body>";
+    html += "<h1>DataFruit Control V1.1</h1>";
+
+
+     // ✅ Adiciona aviso se SD não carregou
+    if (!sdCarregadoComSucesso) {
+        html += "<div class='alerta'>Atenção: Cartão SD não carregado corretamente!</div>";
+    }
+
+
+    html += "<p>" + diaDaSemana + ", " + (now.hour() < 10 ? "0" : "") + String(now.hour()) + ":" + 
+            (now.minute() < 10 ? "0" : "") + String(now.minute()) + "</p>";
+
+    html += "<a href='/configurar'>Configurar Válvulas</a>";
+    html += "<a href='/configuracoes_reles'>Ver Configurações</a>";
+    html += "<a href='/apagar'>Apagar Configurações</a>";
+    html += "<a href='/ajustar'>Data e Hora</a>";
+    html += "<a href='/controle_reles'>Controle Manual</a>";
+    html += "<a href='/configurar_nomes'>Nomear Válvulas</a>";
+    html += "<a href='/apagar_nomes'>Apagar Nomes das Válvulas</a>";
+    html += "<a href='/connect'>Rede</a>";
+    html += "<a href='/diagnosticoSD'>Cartão de Memoria</a>";
+    html += "<a href='/fertirrigação'>Programar Fertirrigação</a>";    
+    html += "<a href='/apagar_horario'>Apagar Fertirrigação</a>";    
+    html += "<a href='/gerenciar_agendamentos'>Fertirrigação Agendada</a>"; 
+    html += "<a href='/nomes_fertilizantes'>Nomes dos Fertilizantes</a>";
+    html += "<a href='/parâmetros_fertirrigação'>Parâmetros da Irrigação</a>";
+    html += "<a href='/calibracao'>Calibracão dos Inejtores</a>";
+  
+    html += "<a href='/verificacao'>Hora de Verificar</a>";
+    
+
+    
+
+
+
+    // Carregar os nomes das válvulas do cartão SD
+    String nomesReles[32];
+    carregarNomesRelesDoSD(nomesReles);
+
+    // Adicionando status de ativação dos relés no final da página
+    String relaysStatus = "<div style='margin-top: 30px; padding-top: 20px;'><p><b>Status das Válvulas:</b><br>";
+    
+    for (int i = 0; i < 32; i++) {
+        bool isRelayActive = false;
+        
+        // Verifica se o relé está ativado
+        for (int j = 0; j < 15; j++) {
+            int horaLigar = horariosLigar[i][j].hora;
+            int minutoLigar = horariosLigar[i][j].minuto;
+            int horaDesligar = horariosDesligar[i][j].hora;
+            int minutoDesligar = horariosDesligar[i][j].minuto;
+            bool algumDiaConfigurado = false;
+
+            // Verifica se o relé deve estar ligado com base nos horários
+            if (horaLigar != -1 && minutoLigar != -1 && horaDesligar != -1 && minutoDesligar != -1) {
+                int diaAtual = now.dayOfTheWeek(); // Obtém o dia da semana atual
+                // Verifica se o horário de ligar está no intervalo e se o horário de desligar não foi atingido
+                if (horariosLigar[i][j].diasSemana[diaAtual] && 
+                    (now.hour() > horaLigar || (now.hour() == horaLigar && now.minute() >= minutoLigar)) &&
+                    (now.hour() < horaDesligar || (now.hour() == horaDesligar && now.minute() < minutoDesligar))) {
+                    isRelayActive = true;
+                    break;
+                }
+            }
+        }
+
+        // Exibir nome da válvula, se houver
+        String nomeValvula = nomesReles[i];
+        String nomeExibido = "Válvula " + String(i + 1); // Nome básico com número da válvula
+        if (nomeValvula.length() > 0) {
+            nomeExibido += " - " + nomeValvula;  // Adiciona o nome se existir
+        }
+
+        // Só exibe o status do relé se ele estiver ativado
+        if (isRelayActive) {
+            relaysStatus += nomeExibido + " está ativada.<br>";
+        }
+    }
+    
+    relaysStatus += "</p></div>";
+    html += relaysStatus; // Exibe o status dos relés ativados
+
+    html += "</body></html>";
+
+    request->send(200, "text/html", html);
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+//////////////////////////////////////////////////// Página para configuração de relés//////////////////////////////////////////////////////
+server.on("/configurar", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String html = "<html><head>";
+    html += "<meta charset='UTF-8'>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+    html += "<style>";
+    html += "body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f4f4f4; display: flex; justify-content: center; align-items: center; height: 100vh; flex-direction: column; }";
+    html += "h1 { text-align: center; color: #4CAF50; font-size: 36px; margin-top: 0; font-weight: bold; }";  // Título em verde e maior
+    html += "form { max-width: 600px; width: 100%; padding: 20px; background-color: #fff; border-radius: 10px; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1); text-align: center; }";
+    html += "label { display: block; margin: 15px 0 5px; color: #555; font-size: 16px; text-align: left; }";
+    html += "input[type='text'], select { width: 100%; padding: 12px; margin-bottom: 15px; border: 1px solid #ccc; border-radius: 5px; font-size: 16px; }";
+    html += "input[type='submit'] { background-color: #4CAF50; color: white; border: none; padding: 15px; font-size: 18px; border-radius: 5px; cursor: pointer; display: block; margin: 0 auto; width: 100%; }";  // Botão "Salvar" com tamanho igual
+    html += "input[type='submit']:hover { background-color: #45a049; }";
+    html += "a { display: block; text-align: center; margin-top: 20px; text-decoration: none; color: white; background-color: #4CAF50; padding: 10px; border-radius: 5px; font-size: 16px; }";
+    html += "a:hover { background-color: #45a049; }";
+    html += "input[type='checkbox'] { margin: 5px 10px; }";
+    html += "</style>";
+    html += "<script>";
+    html += "function formatTime(input) {";
+    html += "    let value = input.value.replace(/[^0-9]/g, '');";
+    html += "    if (value.length > 2) value = value.slice(0, 2) + ':' + value.slice(2, 4);";
+    html += "    if (value.length > 5) value = value.slice(0, 5);";
+    html += "    input.value = value;";
+    html += "}"; 
+    html += "</script>";
+    html += "</head><body>";
+    html += "<h1>Configurar Válvulas</h1>";
+    html += "<form action='/configurar_rele' method='GET'>";
+
+    // Carregar os nomes dos relés do cartão SD
+    String nomesReles[32];
+    carregarNomesRelesDoSD(nomesReles);
+
+    html += "<label for='rele'>Escolha a Válvula:</label>";
+    html += "<select name='rele' id='rele' required>";
+
+    // Preencher as opções do select com os números e nomes dos relés
+    for (int i = 0; i < 32; i++) {
+        String nome = nomesReles[i];
+        String opcao = String(i + 1);  // Número da válvula
+
+        if (nome.length() > 0) {
+            opcao += " - " + nome;  // Se houver nome, adiciona ao número
+        }
+
+        html += "<option value='" + String(i + 1) + "'>" + opcao + "</option>";
+    }
+
+    html += "</select>";
+
+    html += "<label for='horario'>Escolha o Horário:</label>";
+    html += "<select name='horario' id='horario' required>";
+    for (int i = 1; i <= 15; i++) {
+        html += "<option value='" + String(i) + "'>" + String(i) + "</option>";
+    }
+    html += "</select>";
+
+    html += "<label for='dias'>Escolha os Dias da Semana:</label><br>";
+    html += "<div style='text-align: center; margin-bottom: 20px;'>";
+    html += "<label style='display: inline-block; margin-right: 5px;'><input type='checkbox' name='dias' value='1'> Dom</label>";
+    html += "<label style='display: inline-block; margin-right: 5px;'><input type='checkbox' name='dias' value='2'> Seg</label>";
+    html += "<label style='display: inline-block; margin-right: 5px;'><input type='checkbox' name='dias' value='3'> Ter</label>";
+    html += "<label style='display: inline-block; margin-right: 5px;'><input type='checkbox' name='dias' value='4'> Qua</label>";
+    html += "<label style='display: inline-block; margin-right: 5px;'><input type='checkbox' name='dias' value='5'> Qui</label>";
+    html += "<label style='display: inline-block; margin-right: 5px;'><input type='checkbox' name='dias' value='6'> Sex</label>";
+    html += "<label style='display: inline-block; margin-right: 5px;'><input type='checkbox' name='dias' value='7'> Sáb</label>";
+    html += "</div>";
+
+    html += "<label for='hora_ligar'>Ligar:</label>";
+    html += "<input type='text' name='hora_ligar' id='hora_ligar' maxlength='5' oninput='formatTime(this);' required>";
+
+    html += "<label for='hora_desligar'>Desligar:</label>";
+    html += "<input type='text' name='hora_desligar' id='hora_desligar' maxlength='5' oninput='formatTime(this);' required>";
+
+    html += "<input type='submit' value='Salvar'>";
+    html += "</form>";
+    html += "<a href='/'>Voltar para a página inicial</a>";
+    html += "</body></html>";
+
+    request->send(200, "text/html", html);
+});
+
+///////////////////////// Ver configurações ////////////////////////////////////////////////////////////////////////////////////////////
+server.on("/configurar_rele", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (request->hasParam("rele") && request->hasParam("horario") &&
+        request->hasParam("hora_ligar") && request->hasParam("hora_desligar")) {
+
+        int releEscolhido = request->getParam("rele")->value().toInt() - 1;
+        int horarioEscolhido = request->getParam("horario")->value().toInt() - 1;
+
+        String horaLigarStr = request->getParam("hora_ligar")->value();
+        String horaDesligarStr = request->getParam("hora_desligar")->value();
+
+        int horaLigar = horaLigarStr.substring(0, 2).toInt();
+        int minutoLigar = horaLigarStr.substring(3, 5).toInt();
+        int horaDesligar = horaDesligarStr.substring(0, 2).toInt();
+        int minutoDesligar = horaDesligarStr.substring(3, 5).toInt();
+
+        // Converte para minutos para comparar
+        int minutosLigar = horaLigar * 60 + minutoLigar;
+        int minutosDesligar = horaDesligar * 60 + minutoDesligar;
+
+        if (minutosDesligar <= minutosLigar) {
+            // Resposta com erro
+            String html = "<html><head>";
+            html += "<meta charset='UTF-8'>";
+            html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+            html += "<style>";
+            html += "body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f4f4f4; display: flex; flex-direction: column; text-align: center; }";
+            html += "h1 { color: #f44336; font-size: 36px; font-weight: bold; margin-top: 30px; }";
+            html += "a { display: block; text-align: center; margin-top: 20px; text-decoration: none; color: white; background-color: #4CAF50; padding: 15px 30px; border-radius: 10px; font-size: 18px; width: 80%; max-width: 400px; }";
+            html += "a:hover { background-color: #45a049; }";
+            html += "</style>";
+            html += "</head><body>";
+            html += "<h1>Erro: O horário de desligar não pode ser menor que o horário de ligar.</h1>";
+            html += "<a href='/configurar'>Voltar e corrigir</a>";
+            html += "</body></html>";
+
+            request->send(200, "text/html", html);
+            return;
+        }
+
+        // Inicializa o array de dias (0 a 6), 1 significa selecionado
+        int diasSemana[7] = {0};
+
+        // Verifica quais dias foram selecionados
+        for (int i = 0; i < request->params(); i++) {
+            AsyncWebParameter* p = request->getParam(i);
+            if (p->name().startsWith("dias")) {
+                int diaSemana = p->value().toInt() - 1; // Ajusta para o índice (0 a 6)
+                if (diaSemana >= 0 && diaSemana < 7) {
+                    diasSemana[diaSemana] = 1; // Marca o dia como selecionado
+                }
+            }
+        }
+
+        // Verifica se o relé e horário são válidos
+        if (releEscolhido >= 0 && releEscolhido < 32 && horarioEscolhido >= 0 && horarioEscolhido < 15) {
+            horariosLigar[releEscolhido][horarioEscolhido].hora = horaLigar;
+            horariosLigar[releEscolhido][horarioEscolhido].minuto = minutoLigar;
+            horariosDesligar[releEscolhido][horarioEscolhido].hora = horaDesligar;
+            horariosDesligar[releEscolhido][horarioEscolhido].minuto = minutoDesligar;
+
+            // Marca os dias da semana para ligar/desligar
+            for (int i = 0; i < 7; i++) {
+                if (diasSemana[i] == 1) {
+                    horariosLigar[releEscolhido][horarioEscolhido].diasSemana[i] = true;
+                    horariosDesligar[releEscolhido][horarioEscolhido].diasSemana[i] = true;
+                }
+            }
+
+            // Salva as configurações no cartão SD
+            salvarHorariosNoSD();
+
+            // Resposta com página responsiva
+            String html = "<html><head>";
+            html += "<meta charset='UTF-8'>";
+            html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+            html += "<style>";
+            html += "body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f4f4f4; display: flex; flex-direction: column; text-align: center; }";
+            html += "h1 { color: #4CAF50; font-size: 36px; font-weight: bold; margin-top: 30px; }"; // Título verde e grande
+            html += "a { display: block; text-align: center; margin-top: 20px; text-decoration: none; color: white; background-color: #4CAF50; padding: 15px 30px; border-radius: 10px; font-size: 18px; width: 80%; max-width: 400px; }"; // Botão grande e responsivo
+            html += "a:hover { background-color: #45a049; }";
+            html += "</style>";
+            html += "</head><body>";
+            html += "<h1>Configuração salva com sucesso!</h1>";
+            html += "<a href='/'>Voltar</a>";
+            html += "</body></html>";
+
+            request->send(200, "text/html", html);
+        } else {
+            // Resposta com página responsiva para erro
+            String html = "<html><head>";
+            html += "<meta charset='UTF-8'>";
+            html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+            html += "<style>";
+            html += "body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f4f4f4; display: flex; flex-direction: column; text-align: center; }";
+            html += "h1 { color: #4CAF50; font-size: 36px; font-weight: bold; margin-top: 30px; }"; // Título verde e grande
+            html += "a { display: block; text-align: center; margin-top: 20px; text-decoration: none; color: white; background-color: #4CAF50; padding: 15px 30px; border-radius: 10px; font-size: 18px; width: 80%; max-width: 400px; }"; // Botão grande e responsivo
+            html += "a:hover { background-color: #45a049; }";
+            html += "</style>";
+            html += "</head><body>";
+            html += "<h1>Configuração inválida. Tente novamente.</h1>";
+            html += "<a href='/'>Voltar</a>";
+            html += "</body></html>";
+
+            request->send(200, "text/html", html);
+        }
+    } else {
+        // Resposta com página responsiva para parâmetros incompletos
+        String html = "<html><head>";
+        html += "<meta charset='UTF-8'>";
+        html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+        html += "<style>";
+        html += "body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f4f4f4; display: flex; flex-direction: column; text-align: center; }";
+        html += "h1 { color: #4CAF50; font-size: 36px; font-weight: bold; margin-top: 30px; }"; // Título verde e grande
+        html += "a { display: block; text-align: center; margin-top: 20px; text-decoration: none; color: white; background-color: #4CAF50; padding: 15px 30px; border-radius: 10px; font-size: 18px; width: 80%; max-width: 400px; }"; // Botão grande e responsivo
+        html += "a:hover { background-color: #45a049; }";
+        html += "</style>";
+        html += "</head><body>";
+        html += "<h1>Parâmetros incompletos.</h1>";
+        html += "<a href='/'>Voltar</a>";
+        html += "</body></html>";
+
+        request->send(200, "text/html", html);
+    }
+});
+
+
+
+
+
+
+
+server.on("/configurar_nomes", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String html = "<html><head>";
+    html += "<meta charset='UTF-8'>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+    html += "<style>";
+    html += "body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f4f4f4; display: flex; flex-direction: column; align-items: center; height: 100vh; }";
+    html += "h1 { text-align: center; color: #4CAF50; font-size: 28px; margin-top: 20px; }"; // Título verde
+    html += "form { max-width: 600px; width: 100%; padding: 20px; background-color: #fff; border-radius: 10px; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1); text-align: center; margin-top: 10px; }";
+    html += "label { display: block; margin: 15px 0 5px; color: #555; font-size: 16px; text-align: left; }";
+    html += "select, input { width: 100%; padding: 12px; margin-bottom: 15px; border: 1px solid #ccc; border-radius: 5px; font-size: 16px; }";
+    html += "input[type='text'] { background-color: #fff; }";
+    html += "input[type='submit'] { background-color: #4CAF50; color: white; border: none; padding: 15px; font-size: 18px; border-radius: 5px; cursor: pointer; display: block; margin: 10px auto; width: 100%; }";
+    html += "input[type='submit']:hover { background-color: #45a049; }";
+    html += "a { display: block; text-align: center; margin-top: 15px; text-decoration: none; color: white; background-color: #4CAF50; padding: 10px; border-radius: 5px; font-size: 16px; width: 100%; }";
+    html += "a:hover { background-color: #45a049; }";
+    html += "</style>";
+    html += "</head><body>";
+    html += "<h1>Editar Nome do Válvula</h1>";
+    html += "<form action='/atualizar_nome' method='GET'>";
+
+    // Dropdown para selecionar o relé
+    html += "<label for='rele'>Escolha Válvula:</label>";
+    html += "<select name='rele' id='rele' required>";
+    for (int i = 0; i < 32; i++) {
+        html += "<option value='" + String(i) + "'>Válvula " + String(i + 1) + "</option>";
+    }
+    html += "</select>";
+
+    // Campo de entrada para o novo nome
+    html += "<label for='nome'>Novo Nome:</label>";
+    html += "<input type='text' name='nome' id='nome' placeholder='Digite o novo nome' required>";
+
+    html += "<input type='submit' value='Salvar Nome'>";
+    html += "</form>";
+
+    // Botão para voltar à página inicial
+    html += "<a href='/'>Voltar para a página inicial</a>";
+
+    html += "</body></html>";
+
+    request->send(200, "text/html", html);
+});
+
+
+server.on("/atualizar_nome", HTTP_GET, [](AsyncWebServerRequest *request) {
+      if (request->hasParam("rele") && request->hasParam("nome")) {
+        int releIndex = request->getParam("rele")->value().toInt();
+        String novoNome = request->getParam("nome")->value();
+
+        // Atualiza apenas o nome selecionado
+        atualizarNomeDoRele(releIndex, novoNome);
+
+
+        // Resposta ao usuário
+        String html = "<html><head>";
+        html += "<meta charset='UTF-8'>";
+        html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+        html += "<style>";
+        html += "body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f4f4f4; text-align: center; }";
+        html += "h1 { color: #4CAF50; font-size: 28px; margin-top: 20px; padding: 10px; }";
+        html += ".container { max-width: 400px; width: 90%; margin: 20px auto; }";
+        html += "a { display: block; text-align: center; margin-top: 20px; text-decoration: none; color: white; background-color: #4CAF50; padding: 15px; border-radius: 8px; font-size: 18px; box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2); width: 100%; max-width: 300px; margin-left: auto; margin-right: auto; }";
+        html += "a:hover { background-color: #45a049; }";
+        html += "</style>";
+        html += "</head><body>";
+
+        html += "<h1>Nome da válvula " + String(releIndex + 1) + " atualizado com sucesso!</h1>";
+        html += "<div class='container'>";
+        html += "<a href='/'>Voltar para a Página Inicial</a>";
+        html += "</div>";
+
+        html += "</body></html>";
+
+        request->send(200, "text/html", html);
+    }
+});
+
+
+
+
+server.on("/apagar_nomes", HTTP_GET, [](AsyncWebServerRequest *request) { 
+    String html = "<html><head>";
+    html += "<meta charset='UTF-8'>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+    html += "<style>";
+    html += "body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f4f4f4; display: flex; flex-direction: column; align-items: center; height: 100vh; }";
+    html += "h1 { text-align: center; color: #4CAF50; font-size: 28px; margin-top: 20px; }"; // Título verde
+    html += "form { max-width: 600px; width: 100%; padding: 20px; background-color: #fff; border-radius: 10px; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1); text-align: center; margin-top: 10px; }";
+    html += "label { display: block; margin: 15px 0 5px; color: #555; font-size: 16px; text-align: left; }";
+    html += "select, input { width: 100%; padding: 12px; margin-bottom: 15px; border: 1px solid #ccc; border-radius: 5px; font-size: 16px; }";
+    html += "input[type='submit'] { background-color: #4CAF50; color: white; border: none; padding: 15px; font-size: 18px; border-radius: 5px; cursor: pointer; display: block; margin: 10px auto; width: 100%; }";
+    html += "input[type='submit']:hover { background-color: #45a049; }";
+    html += "a { display: block; text-align: center; margin-top: 15px; text-decoration: none; color: white; background-color: #4CAF50; padding: 10px; border-radius: 5px; font-size: 16px; width: 100%; }";
+    html += "a:hover { background-color: #45a049; }";
+    html += "</style>";
+    html += "</head><body>";
+    html += "<h1>Apagar Nome do Válvula</h1>";
+    html += "<form action='/remover_nome' method='GET'>";
+
+    // Carregar os nomes dos relés do cartão SD
+    String nomesReles[32];
+    carregarNomesRelesDoSD(nomesReles);
+
+    html += "<label for='rele'>Escolha a Válvula:</label>";
+    html += "<select name='rele' id='rele' required>";
+
+    // Preencher as opções do select com os números e nomes dos relés
+    for (int i = 0; i < 32; i++) {
+        String nome = nomesReles[i];
+        String opcao = String(i + 1);  // Número da válvula
+
+        if (nome.length() > 0) {
+            opcao += " - " + nome;  // Se houver nome, adiciona ao número
+        }
+
+        html += "<option value='" + String(i) + "'>" + opcao + "</option>";
+    }
+
+    html += "</select>";
+    html += "<input type='submit' value='Apagar Nome'>";
+    html += "</form>";
+
+    // Botão para voltar à página inicial
+    html += "<a href='/'>Voltar para a página inicial</a>";
+
+    html += "</body></html>";
+
+    request->send(200, "text/html", html);
+});
+
+
+server.on("/remover_nome", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (request->hasParam("rele")) {
+        String rele = request->getParam("rele")->value();
+        int releIndex = rele.toInt();
+
+        // Remover o nome do relé (salvando vazio ou removendo do arquivo de configuração)
+        // Exemplo, usando a abordagem de salvar no cartão SD com arquivo
+
+        // Lógica para remover o nome do cartão SD (ou qualquer outra forma de armazenamento)
+        removeNomeDoRele(releIndex); // Função para remover o nome do relé
+
+        // Resposta com estilo similar à de atualizar o nome
+        String html = "<html><head>";
+        html += "<meta charset='UTF-8'>";
+        html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+        html += "<style>";
+        html += "body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f4f4f4; text-align: center; }";
+        html += "h1 { color: #4CAF50; font-size: 28px; margin-top: 20px; padding: 10px; }";
+        html += ".container { max-width: 400px; width: 90%; margin: 20px auto; }";
+        html += "a { display: block; text-align: center; margin-top: 20px; text-decoration: none; color: white; background-color: #4CAF50; padding: 15px; border-radius: 8px; font-size: 18px; box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2); width: 100%; max-width: 300px; margin-left: auto; margin-right: auto; }";
+        html += "a:hover { background-color: #45a049; }";
+        html += "</style>";
+        html += "</head><body>";
+
+        html += "<h1>Nome do Válvula " + String(releIndex + 1) + " Apagado com Sucesso!</h1>";
+        html += "<div class='container'>";
+        html += "<a href='/'>Voltar para a Página Inicial</a>";
+        html += "</div>";
+
+        html += "</body></html>";
+
+        request->send(200, "text/html", html);
+    }
+});
+
+
+
+
+
+
+
+
+
+
+server.on("/configuracoes_reles", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String html = "<html><head>";
+    html += "<meta charset='UTF-8'>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+    html += "<style>";
+    html += "body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f4f4f4; }";
+    html += "h1 { color: #4CAF50; text-align: center; font-size: 28px; margin-bottom: 20px; }";
+    html += "table { width: 100%; border-collapse: collapse; margin: 20px 0; text-align: center; }";
+    html += "table, th, td { border: 1px solid #ddd; }";
+    html += "th, td { text-align: center; padding: 12px; font-size: 16px; }";
+    html += "th { background-color: #4CAF50; color: white; position: sticky; top: 0; }"; // Fixar título
+    html += "tr:nth-child(even) { background-color: #f9f9f9; }";
+    html += "tr:hover { background-color: #f1f1f1; }";
+    html += "a { display: block; margin: 20px auto; padding: 15px; text-align: center; color: white; background-color: #4CAF50; text-decoration: none; border-radius: 8px; font-size: 18px; max-width: 300px; }";
+    html += "a:hover { background-color: #45a049; }";
+    html += "@media (max-width: 600px) {";
+    html += "body { padding: 10px; }";
+    html += "h1 { font-size: 24px; }";
+    html += "th, td { font-size: 14px; padding: 10px; }";
+    html += "a { font-size: 16px; padding: 12px; width: 90%; }";
+    html += "}";  
+    html += "</style>";
+    html += "</head><body>";
+    html += "<h1>Configurações das Válvulas</h1>";
+
+    // Nome dos dias da semana
+    String diasDaSemana[] = {"", "Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sab"};
+
+    // Carregar os nomes dos relés do cartão SD
+    String nomesReles[32];
+    carregarNomesRelesDoSD(nomesReles);
+    carregarHorariosDoSD();
+
+    // Gerar uma tabela para cada válvula
+    for (int i = 0; i < 32; i++) {
+        bool temHorarioValido = false;
+        String horariosHtml = "";
+
+        // Personalizar o título da válvula
+        String tituloValvula;
+        if (nomesReles[i].length() > 0) {
+            tituloValvula = "Válvula " + String(i + 1) + " - " + nomesReles[i]; // Número + nome
+        } else {
+            tituloValvula = "Válvula " + String(i + 1) ; // Número + "Nome da Válvula"
+        }
+
+        for (int j = 0; j < 15; j++) {
+            int horaLigar = horariosLigar[i][j].hora;
+            int minutoLigar = horariosLigar[i][j].minuto;
+            int horaDesligar = horariosDesligar[i][j].hora;
+            int minutoDesligar = horariosDesligar[i][j].minuto;
+
+            bool algumDiaConfigurado = false;
+            String dias = "";
+
+            for (int d = 0; d < 7; d++) {
+                if (horariosLigar[i][j].diasSemana[d]) {
+                    dias += diasDaSemana[d + 1] + " "; // Exibe o nome do dia (1 = Dom, 2 = Seg, etc.)
+                    algumDiaConfigurado = true;
+                }
+            }
+
+            if (!algumDiaConfigurado) {
+                dias = "Nenhum dia configurado";
+            }
+
+            // Se os horários forem válidos, adicione na tabela
+            if (horaLigar != -1 && minutoLigar != -1 && horaDesligar != -1 && minutoDesligar != -1) {
+                temHorarioValido = true;
+
+                // Adicionando linha de horário
+                horariosHtml += "<tr><td>" + String(j + 1) + "</td><td>" + 
+                                String(horaLigar < 10 ? "0" : "") + String(horaLigar) + ":" +
+                                String(minutoLigar < 10 ? "0" : "") + String(minutoLigar) +
+                                "     |     " +
+                                String(horaDesligar < 10 ? "0" : "") + String(horaDesligar) + ":" +
+                                String(minutoDesligar < 10 ? "0" : "") + String(minutoDesligar) + "</td>";
+
+                // Linha separada para os dias
+                horariosHtml += "<td>" + dias + "</td></tr>";
+            }
+        }
+
+        // Só adiciona a tabela se houver horários válidos
+        if (temHorarioValido) {
+            html += "<table>";
+            html += "<tr><th colspan='3'>" + tituloValvula + "</th></tr>"; // Título personalizado
+            html += "<tr><th>Horario</th><th> Liga | Desliga</th><th>Dias da Semana</th></tr>";
+            html += horariosHtml;
+            html += "</table>";
+        }
+    }
+
+    html += "<a href='/'>Voltar para a página inicial</a>";
+    html += "</body></html>";
+
+    request->send(200, "text/html", html);
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ /////////////////////////////////////////////////////Página para apagar configurações de relés/////////////////////////////////////////////////////////////////////////////////
+server.on("/apagar", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String html = "<html><head>";
+    html += "<meta charset='UTF-8'>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+    html += "<style>";
+    html += "body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f4f4f4; text-align: center; }";
+    html += "h1 { color: #4CAF50; font-size: 28px; margin-bottom: 20px; }";
+    html += "form { max-width: 400px; margin: 0 auto 20px auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2); }";
+    html += "label { display: block; margin-bottom: 8px; font-weight: bold; font-size: 16px; }";
+    html += "select, input[type='submit'] { width: 100%; padding: 12px; margin-bottom: 20px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; font-size: 16px; }";
+    html += "input[type='submit'] { background-color: #4CAF50; color: white; cursor: pointer; font-size: 18px; }";
+    html += "input[type='submit']:hover { background-color: #45a049; }";
+    html += "a { display: inline-block; margin-top: 20px; padding: 12px 24px; color: white; background-color: #4CAF50; text-decoration: none; border-radius: 5px; font-size: 18px; }";
+    html += "a:hover { background-color: #45a049; }";
+    html += "</style></head><body>";
+    html += "<h1>Apagar Configurações da Válvula</h1>";
+    html += "<form action='/apagar_rele' method='GET'>";
+    html += "<label for='rele'>Escolha a Válvula:</label>";
+    html += "<select name='rele' id='rele' required>";
+
+    String nomesReles[32];
+    carregarNomesRelesDoSD(nomesReles);
+    for (int i = 0; i < 32; i++) {
+        String nome = nomesReles[i];
+        String opcao = String(i + 1);
+        if (nome.length() > 0) {
+            opcao += " - " + nome;
+        }
+        html += "<option value='" + String(i + 1) + "'>" + opcao + "</option>";
+    }
+    
+    html += "</select>";
+    html += "<input type='submit' value='Apagar Configuração'>";
+    html += "</form>";
+    html += "<div><a href='/'>Voltar para a página inicial</a></div>";
+    html += "</body></html>";
+    
+    request->send(200, "text/html", html);
+});
+
+server.on("/apagar_rele", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (request->hasParam("rele")) {
+        int releEscolhido = request->getParam("rele")->value().toInt();
+
+        if (releEscolhido >= 1 && releEscolhido <= 32) {
+            apagarConfiguracaoRele(releEscolhido); // Agora chamamos a função corretamente
+
+            String html = "<html><head>";
+            html += "<meta charset='UTF-8'>";
+            html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+            html += "<style>";
+            html += "body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f4f4f4; text-align: center; }";
+            html += "h1 { color: #4CAF50; font-size: 28px; margin-bottom: 20px; }";
+            html += "a { display: inline-block; margin-top: 20px; padding: 12px 24px; color: white; background-color: #4CAF50; text-decoration: none; border-radius: 5px; font-size: 18px; max-width: 300px; width: 100%; }";
+            html += "a:hover { background-color: #45a049; }";
+            html += "</style>";
+            html += "</head><body>";
+            html += "<h1>Configurações da Válvula apagadas com sucesso!</h1>";
+            html += "<a href='/'>Voltar para a página inicial</a>";
+            html += "</body></html>";
+
+            request->send(200, "text/html", html);
+        } else {
+            request->send(400, "text/html", "<h1>Relé inválido. Tente novamente.</h1><a href='/'>Voltar para a página inicial</a>");
+        }
+    } else {
+        request->send(400, "text/html", "<h1>Faltam parâmetros na solicitação.</h1><a href='/'>Voltar para a página inicial</a>");
+    }
+});
+
+
+
+
+// Página para ajustar o relógio (data e hora)
+server.on("/ajustar", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String html = "<html><head>";
+    html += "<meta charset='UTF-8'>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"; // Responsividade
+    html += "<style>";
+    html += "body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f4f4f4; }";
+    html += "h1 { color: #4CAF50; text-align: center; font-size: 28px; margin-bottom: 20px; }";
+    html += "form { max-width: 400px; margin: 20px auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2); }";
+    html += "label { display: block; margin-bottom: 8px; font-weight: bold; font-size: 16px; }";
+    html += "input[type='number'], input[type='time'], input[type='submit'] { width: 100%; padding: 12px; margin-bottom: 20px; border: 1px solid #ddd; border-radius: 4px; font-size: 16px; box-sizing: border-box; }";
+    html += "input[type='submit'] { background-color: #4CAF50; color: white; cursor: pointer; }";
+    html += "input[type='submit']:hover { background-color: #45a049; }";
+    html += "a { display: block; margin: 20px auto; padding: 15px; text-align: center; color: white; background-color: #4CAF50; text-decoration: none; border-radius: 8px; font-size: 18px; max-width: 300px; }";
+    html += "a:hover { background-color: #45a049; }";
+    html += "@media (max-width: 600px) {";
+    html += "body { padding: 10px; }"; // Ajuste de padding em dispositivos móveis
+    html += "h1 { font-size: 24px; }"; // Ajuste do título
+    html += "label { font-size: 14px; }"; // Ajuste do texto do label
+    html += "input[type='number'], input[type='time'], input[type='submit'] { font-size: 14px; padding: 10px; }"; // Ajuste dos inputs
+    html += "a { font-size: 16px; padding: 12px; width: 90%; }"; // Ajuste do botão
+    html += "}"; 
+    html += "</style>";
+    
+    // Adiciona o script para preencher os campos automaticamente com a data e hora do dispositivo
+    html += "<script>";
+    html += "window.onload = function() {";
+    html += "  var now = new Date();";
+    html += "  document.getElementById('ano').value = now.getFullYear();";
+    html += "  document.getElementById('mes').value = now.getMonth() + 1;"; // Mes começa do 0, então somamos 1
+    html += "  document.getElementById('dia').value = now.getDate();";
+    html += "  document.getElementById('hora').value = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');";
+    html += "};";
+    html += "</script>";
+    
+    html += "</head><body>";
+    html += "<h1>Ajustar Relógio</h1>";
+    html += "<form action='/ajustar_relogio' method='GET'>";
+    
+    // Campos para data
+    html += "<label for='ano'>Ano:</label>";
+    html += "<input type='number' id='ano' name='ano' min='2000' max='9999' required>";
+
+    html += "<label for='mes'>Mês:</label>";
+    html += "<input type='number' id='mes' name='mes' min='1' max='12' required>";
+    
+    html += "<label for='dia'>Dia:</label>";
+    html += "<input type='number' id='dia' name='dia' min='1' max='31' required>";
+
+    // Campos para hora
+    html += "<label for='hora'>Hora e Minuto:</label>";
+    html += "<input type='time' id='hora' name='hora' required>";
+    
+    html += "<input type='submit' value='Ajustar Relógio'>";
+    html += "</form>";
+    html += "<a href='/'>Voltar para a página inicial</a>";
+    html += "</body></html>";
+
+    request->send(200, "text/html", html);
+});
+
+// Endpoint para ajustar o relógio
+server.on("/ajustar_relogio", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (request->hasParam("ano") && request->hasParam("mes") && request->hasParam("dia") && request->hasParam("hora")) {
+        String anoStr = request->getParam("ano")->value();
+        String mesStr = request->getParam("mes")->value();
+        String diaStr = request->getParam("dia")->value();
+        String horaStr = request->getParam("hora")->value();
+
+        int ano = anoStr.toInt();
+        int mes = mesStr.toInt();
+        int dia = diaStr.toInt();
+        int hora = horaStr.substring(0, 2).toInt();
+        int minuto = horaStr.substring(3, 5).toInt();
+
+        // Ajustar o RTC com os valores fornecidos
+        rtc.adjust(DateTime(ano, mes, dia, hora, minuto, 0)); // Segundos fixos como 0
+
+        // Retornar confirmação para o usuário
+        String html = "<html><head>";
+        html += "<meta charset='UTF-8'>";
+        html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"; // Responsividade
+        html += "<style>";
+        html += "body { font-family: Arial, sans-serif; margin: 0; padding: 0; background-color: #f4f4f4; display: flex; flex-direction: column; justify-content: flex-start; align-items: center; height: 100vh; }";
+        html += "h1 { color: #4CAF50; font-size: 28px; margin-top: 20px; text-align: center; }";
+        html += "p { font-size: 18px; color: #333; text-align: center; margin-top: 10px; }";
+        html += "a { display: block; margin-top: 20px; padding: 15px; text-align: center; color: white; background-color: #4CAF50; text-decoration: none; border-radius: 8px; font-size: 18px; max-width: 300px; }";
+        html += "a:hover { background-color: #45a049; }";
+        html += "</style>";
+        html += "</head><body>";
+        html += "<h1>Relógio ajustado com sucesso!</h1>";
+        html += "<p>Data ajustada: " + diaStr + "/" + mesStr + "/" + anoStr + "</p>";
+        html += "<p>Hora ajustada: " + horaStr + "</p>";
+        html += "<a href='/'>Voltar para a página inicial</a>";
+        html += "</body></html>";
+
+        request->send(200, "text/html", html);
+    } else {
+        request->send(400, "text/html", "<h1>Faltam parâmetros na solicitação.</h1><a href='/'>Voltar para a página inicial</a>");
+    }
+});
+
+
+
+// Página para controle manual dos relés
+server.on("/controle_reles", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String html = "<html><head>";
+    html += "<meta charset='UTF-8'>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"; // Responsividade
+    html += "<style>";
+    html += "body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f4f4f4; display: flex; flex-direction: column; align-items: center; }";
+    html += "h1 { color: #4CAF50; font-size: 28px; margin-bottom: 20px; text-align: center; }";
+    html += "table { width: 100%; max-width: 600px; border-collapse: collapse; margin: 20px 0; text-align: center; }";
+    html += "th, td { padding: 10px; text-align: center; border: 1px solid #ddd; }";
+    html += "th { background-color: #4CAF50; color: white; }";
+    html += "tr:nth-child(even) { background-color: #f9f9f9; }";
+    html += "tr:hover { background-color: #f1f1f1; }";
+    html += "button { font-size: 16px; padding: 10px 20px; background-color: #4CAF50; color: white; border: none; border-radius: 5px; cursor: pointer; transition: background-color 0.3s; width: 100px; }";
+    html += "button:hover { background-color: #45a049; }";
+    html += ".ligado { background-color: #388e3c; }"; // Botão ligado
+    html += "</style>";
+    html += "<script>";
+    html += "function controlarRele(rele, acao) {";
+    html += "  var xhr = new XMLHttpRequest();";
+    html += "  xhr.open('GET', '/' + acao + '_rele?rele=' + rele, true);";
+    html += "  xhr.onreadystatechange = function() {";
+    html += "    if (xhr.readyState == 4 && xhr.status == 200) {";
+    html += "      var btnLigar = document.getElementById('btn_ligar_' + rele);";
+    html += "      var btnDesligar = document.getElementById('btn_desligar_' + rele);";
+    html += "      if (acao == 'ligar') {";
+    html += "        btnLigar.classList.add('ligado');";
+    html += "        btnDesligar.classList.remove('ligado');";
+    html += "      } else {";
+    html += "        btnLigar.classList.remove('ligado');";
+    html += "        btnDesligar.classList.add('ligado');";
+    html += "      }";
+    html += "    }";
+    html += "  };";
+    html += "  xhr.send();";
+    html += "}";
+
+    html += "</script>";
+    html += "</head><body>";
+    html += "<h1>Controle Manual</h1>";
+    html += "<table>";
+    html += "<tr><th>Válvula</th><th>Ligar</th><th>Desligar</th></tr>";
+
+    // Gerar os botões de controle para todos os 24 relés
+    for (int i = 0; i < 32; i++) {
+        html += "<tr>";
+        html += "<td>   " + String(i + 1) + "</td>";
+        html += "<td><button id='btn_ligar_" + String(i) + "' class='desligado' onclick=\"controlarRele(" + String(i) + ", 'ligar')\">Ligar</button></td>";
+        html += "<td><button id='btn_desligar_" + String(i) + "' class='desligado' onclick=\"controlarRele(" + String(i) + ", 'desligar')\">Desligar</button></td>";
+        html += "</tr>";
+    }
+
+    html += "</table>";
+    html += "<a href='/' style='display: block; text-align: center; padding: 15px; background-color: #4CAF50; color: white; text-decoration: none; border-radius: 8px; font-size: 18px; margin-top: 30px;'>Voltar para a página inicial</a>";
+    html += "</body></html>";
+
+    request->send(200, "text/html", html);
+});
+
+// Controle para ligar o relé
+// Controle para ligar o relé
+server.on("/ligar_rele", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (request->hasParam("rele")) {
+        String releStr = request->getParam("rele")->value();
+        int rele = releStr.toInt();
+
+        // Lógica para ligar o relé
+        estadoRele[rele] = LOW; //LOW
+
+        // Controle do relé dependendo se é PCF8575_1, PCF8575_2 ou ESP32
+        if (relePins[rele] >= 100 && relePins[rele] < 200) {
+            // PCF8575_1
+            int pcfPin = relePins[rele] - 100;
+            pcf8575_1.digitalWrite(pcfPin, estadoRele[rele]);
+        } else if (relePins[rele] >= 200) {
+            // PCF8575_2
+            int pcfPin = relePins[rele] - 200;
+            pcf8575_2.digitalWrite(pcfPin, estadoRele[rele]);
+        } else {
+            // Pino do ESP32
+            digitalWrite(relePins[rele], estadoRele[rele]);
+        }
+
+        chave_mestra_ativar(PCF8575_1_P8);
+        request->send(200, "text/html", "Ligado");
+    } else {
+        request->send(400, "text/html", "Parâmetro inválido!");
+    }
+});
+
+// Controle para desligar o relé
+server.on("/desligar_rele", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (request->hasParam("rele")) {
+        String releStr = request->getParam("rele")->value();
+        int rele = releStr.toInt();
+
+        // Lógica para desligar o relé
+        estadoRele[rele] = HIGH; //HIGH
+
+        if (relePins[rele] >= 100 && relePins[rele] < 200) {
+            // PCF8575_1
+            int pcfPin = relePins[rele] - 100;
+            pcf8575_1.digitalWrite(pcfPin, estadoRele[rele]);
+        } else if (relePins[rele] >= 200) {
+            // PCF8575_2
+            int pcfPin = relePins[rele] - 200;
+            pcf8575_2.digitalWrite(pcfPin, estadoRele[rele]);
+        } else {
+            // Pino do ESP32
+            digitalWrite(relePins[rele], estadoRele[rele]);
+        }
+
+        // Verificar se todos os relés estão desligados
+        bool todosDesligados = true;
+        for (int i = 0; i < 32; i++) {
+            if (estadoRele[i] == LOW) { //LOW
+                todosDesligados = false;
+                break;
+            }
+        }
+
+        if (todosDesligados) {
+            chave_mestra_desativar(PCF8575_1_P8);
+        }
+
+        request->send(200, "text/html", "Desligado");
+    } else {
+        request->send(400, "text/html", "Parâmetro inválido!");
+    }
+});
+
+
+
+
+
+
+
+
+
+    server.on("/connect", HTTP_GET, [](AsyncWebServerRequest *request) {
+        String html = "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+        html += "<style>";
+        html += "body { font-family: Arial, sans-serif; text-align: center; background: #f4f4f4; padding: 20px; }";
+        html += ".container { max-width: 400px; margin: auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.2); }";
+        html += "h2 { color: #4CAF50; }";
+        html += "input, button { width: 100%; padding: 10px; margin: 10px 0; border-radius: 5px; border: 1px solid #ddd; }";
+        html += "button { background-color: #4CAF50; color: white; font-size: 16px; cursor: pointer; }";
+        html += "button:hover { background-color: #45a049; }";
+        html += ".status { padding: 10px; border-radius: 5px; margin-top: 10px; }";
+        html += ".connected { background: #d4edda; color: #155724; }";
+        html += ".disconnected { background: #f8d7da; color: #721c24; }";
+        html += "</style></head><body>";
+        
+        html += "<div class='container'>";
+        html += "<h2>Configurar Rede Wi-Fi</h2>";
+        html += "<form action='/handleConnect' method='POST'>";
+        html += "<input type='text' name='ssid' placeholder='Nome da Rede (SSID)' required>";
+        html += "<input type='password' name='password' placeholder='Senha' required>";
+        html += "<button type='submit'>Conectar</button>";
+        html += "</form>";
+
+        html += "<h2>Status da Conexão</h2>";
+        if (WiFi.status() == WL_CONNECTED) {
+            html += "<div class='status connected'>✅ Conectado à rede: <b>" + WiFi.SSID() + "</b><br>";
+            html += "IP Local: <b>" + WiFi.localIP().toString() + "</b></div>";
+        } else {
+            html += "<div class='status disconnected'>❌ Não conectado a nenhuma rede Wi-Fi.</div>";
+        }
+        html += "<div class='status'>IP do AP: <b>" + WiFi.softAPIP().toString() + "</b></div>";
+
+        html += "<form action='/resetWiFi' method='POST'>";
+        html += "<button type='submit' style='background-color: red;'>Apagar Rede e Desconectar</button>";
+        html += "</form>";
+
+        html += "</div></body></html>";
+
+        request->send(200, "text/html", html);
+    });
+
+    server.on("/handleConnect", HTTP_POST, [](AsyncWebServerRequest *request) {
+        if (request->hasParam("ssid", true) && request->hasParam("password", true)) {
+            String ssid = request->getParam("ssid", true)->value();
+            String password = request->getParam("password", true)->value();
+            salvarWiFiNaEEPROM(ssid, password);
+       
+        String response = "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+        response += "<style>";
+        response += "body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f4f4f4; }";
+        response += ".container { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.2); display: inline-block; }";
+        response += "h2 { color: #4CAF50; }";
+        response += ".loader { border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; width: 30px; height: 30px; animation: spin 1s linear infinite; display: inline-block; }";
+        response += "@keyframes spin { 100% { transform: rotate(360deg); } }";
+        response += "</style></head><body>";
+        response += "<div class='container'><h2>Rede salva! Reiniciando...</h2>";
+        response += "<div class='loader'></div><br><small>Aguarde...</small></div>";
+        response += "<script>setTimeout(()=>{window.location='/connect'}, 3000);</script>";
+        response += "</body></html>";
+
+        request->send(200, "text/html", response);
+        delay(1000);
+        ESP.restart();
+    } else {
+        request->send(400, "text/plain", "Erro: Parâmetros ausentes.");
+    }
+    });
+
+    server.on("/resetWiFi", HTTP_POST, [](AsyncWebServerRequest *request) {
+        apagarWiFiDaEEPROM();
+        WiFi.disconnect();
+        String response = "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+    response += "<style>";
+    response += "body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f4f4f4; }";
+    response += ".container { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.2); display: inline-block; }";
+    response += "h2 { color: red; }";
+    response += ".loader { border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; width: 30px; height: 30px; animation: spin 1s linear infinite; display: inline-block; }";
+    response += "@keyframes spin { 100% { transform: rotate(360deg); } }";
+    response += "</style></head><body>";
+    response += "<div class='container'><h2>Rede apagada! Reiniciando...</h2>";
+    response += "<div class='loader'></div><br><small>Aguarde...</small></div>";
+    response += "<script>setTimeout(()=>{window.location='/connect'}, 3000);</script>";
+    response += "</body></html>";
+
+    request->send(200, "text/html", response);
+    delay(1000);
+    ESP.restart();
+    });
+
+
+
+
+
+
+
+
+
+
+
+// Diagnóstico SD
+server.on("/diagnosticoSD", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String html = "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+
+    // CSS responsivo e bonito
+    html += "<style>";
+    html += "body { font-family: Arial, sans-serif; text-align: center; background: #f4f4f4; padding: 20px; }";
+    html += "h2 { color: #4CAF50; font-size: 24px; margin-bottom: 15px; }";
+    html += ".container { max-width: 95%; margin: auto; }";
+    html += "table { width: 100%; border-collapse: collapse; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }";
+    html += "th, td { padding: 8px; text-align: left; border-bottom: 1px solid #ddd; font-size: 14px; }";
+    html += "th { background-color: #4CAF50; color: white; }";
+    html += ".btn { display: inline-block; width: 80px; padding: 8px; margin: 5px; background: #007BFF; color: white; border-radius: 5px; font-size: 14px; text-decoration: none; }";
+    html += ".btn:hover { background: #0056b3; }";
+    html += ".delete-btn { background: #FF5733; }";
+    html += ".delete-btn:hover { background: #C70039; }";
+    html += "form { margin-top: 20px; }";
+    html += "input[type='file'] { margin-top: 10px; }";
+    html += "input[type='submit'] { background-color: #4CAF50; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; padding: 8px 16px; margin-top: 10px; }";
+    html += "input[type='submit']:hover { background-color: #45a049; }";
+    html += "@media (max-width: 768px) { table { font-size: 12px; } th, td { padding: 6px; } .btn { width: 70px; font-size: 12px; padding: 6px; } input[type='submit'] { font-size: 12px; padding: 6px 12px; } }";
+    html += "</style></head><body>";
+
+    html += "<div class='container'>";
+    html += "<h2>Diagnóstico do Cartão SD</h2>";
+
+    if (SD.begin()) {
+        html += "<div style='color: #155724; background: #d4edda; padding: 10px; border-radius: 5px; margin-bottom: 15px;'>Cartão SD montado com sucesso.</div>";
+
+        // Tabela de arquivos
+        html += "<h3>Arquivos no Cartão SD:</h3>";
+        html += "<table>";
+        html += "<tr><th>Arquivo</th><th>Tamanho (MB)</th><th>Ações</th></tr>";
+
+        File root = SD.open("/");
+        while (true) {
+            File entry = root.openNextFile();
+            if (!entry) break;
+            String fileName = entry.name();
+            float fileSizeMB = entry.size() / 1048576.0;
+
+            html += "<tr>";
+            html += "<td>" + fileName + "</td>";
+            html += "<td>" + String(fileSizeMB, 2) + " MB</td>";
+            html += "<td>";
+            html += "<a href='/download?file=" + fileName + "' class='btn'>Baixar</a>";
+            html += "<a href='/delete?file=" + fileName + "' class='btn delete-btn' onclick='return confirm(\"Tem certeza que deseja excluir este arquivo?\")'>Excluir</a>";
+            html += "</td>";
+            html += "</tr>";
+
+            entry.close();
+        }
+        html += "</table>";
+
+        // Espaço disponível
+        html += "<div style='background: #f4f4f4; padding: 10px; border-radius: 5px; margin-top: 15px;'>";
+        html += "<h3>Espaço disponível:</h3>";
+        html += "<p><b>" + String((SD.totalBytes() - SD.usedBytes()) / 1048576.0, 2) + " MB</b> disponíveis</p>";
+        html += "</div>";
+
+        // Formulário de upload
+        html += "<h3>Enviar novo arquivo para o cartão SD:</h3>";
+        html += "<form method='POST' action='/upload' enctype='multipart/form-data'>";
+        html += "<input type='file' name='uploadedFile'>";
+        html += "<br>";
+        html += "<input type='submit' value='Upload'>";
+        html += "</form>";
+
+    } else {
+        html += "<div style='color: #721c24; background: #f8d7da; padding: 10px; border-radius: 5px;'>Falha ao montar o cartão SD.</div>";
+    }
+
+    html += "<a href='/' class='btn' style='width: 100px; margin-top: 15px;'>Voltar</a>";
+    html += "</div></body></html>";
+
+    request->send(200, "text/html", html);
+});
+
+
+
+server.on("/download", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String fileName = request->getParam("file")->value();
+    String filePath = "/" + fileName;
+
+    if (SD.exists(filePath)) {
+        // Usar o método send() passando o caminho do arquivo
+        request->send(SD, filePath, "application/octet-stream", true);
+    } else {
+        request->send(404, "text/plain", "Arquivo não encontrado.");
+    }
+});
+
+// Endpoint para deletar arquivos do SD
+server.on("/delete", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String html = "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+    html += "<style>";
+    html += "body { font-family: Arial, sans-serif; text-align: center; background: #f4f4f4; padding: 20px; }";
+    html += "h2 { color: #333; }";
+    html += ".message { padding: 15px; border-radius: 5px; margin: 20px auto; width: 80%; max-width: 400px; font-size: 16px; }";
+    html += ".success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }";
+    html += ".error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }";
+    html += ".btn { display: inline-block; padding: 10px 20px; margin-top: 15px; background: #007BFF; color: white; border-radius: 5px; text-decoration: none; }";
+    html += ".btn:hover { background: #0056b3; }";
+    html += "</style></head><body>";
+
+    if (request->hasParam("file")) {
+        String fileName = request->getParam("file")->value();
+        String filePath = "/" + fileName;
+
+        if (SD.exists(filePath)) {
+            SD.remove(filePath);
+            html += "<div class='message success'>Arquivo <b>" + fileName + "</b> deletado com sucesso.</div>";
+        } else {
+            html += "<div class='message error'>Erro: Arquivo <b>" + fileName + "</b> não encontrado.</div>";
+        }
+    } else {
+        html += "<div class='message error'>Erro: Nenhum arquivo especificado para exclusão.</div>";
+    }
+
+    html += "<a href='/diagnosticoSD' class='btn'>Voltar</a>";
+    html += "</body></html>";
+
+    request->send(200, "text/html", html);
+});
+
+
+server.on("/upload", HTTP_POST, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/html", "<html><body style='text-align:center; font-family:Arial;'><h2>Upload finalizado!</h2><a href='/diagnosticoSD'>Voltar</a></body></html>");
+}, [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
+    String path = "/" + filename;
+    static File uploadFile;
+
+    if (!index) {  // primeira parte do upload
+        Serial.printf("Recebendo arquivo: %s\n", filename.c_str());
+        uploadFile = SD.open(path, FILE_WRITE);
+    }
+    if (uploadFile) {
+        uploadFile.write(data, len);
+    }
+    if (final) {
+        if (uploadFile) {
+            uploadFile.close();
+            Serial.printf("Upload do arquivo %s concluído\n", filename.c_str());
+        } else {
+            Serial.println("Falha ao abrir o arquivo para escrita.");
+        }
+    }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+//fertirrigação
+
+
+
+//Fertirrigação 
+// Rota para a página de fertirrigação
+server.on("/fertirrigação", HTTP_GET, [](AsyncWebServerRequest *request) {
+
+
+      String nomesFertilizantes[10];
+    carregarNomesFertilizantesDoSD(nomesFertilizantes);
+
+
+    String html = "<!DOCTYPE html><html><head>";
+    html += "<meta charset='UTF-8'>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+    html += "<style>";
+    html += "body { font-family: Arial, sans-serif; padding: 20px; background-color: #f4f4f4; }";
+    html += "label, select, input { display: block; margin: 10px auto; max-width: 400px; font-size: 16px; }";
+    html += "select, input[type='time'], input[type='number'], input[type='text'] { width: 100%; padding: 10px; border-radius: 5px; }";
+    html += "h1 { text-align: center; color: #4CAF50; margin-bottom: 30px; }";
+    html += "#diasSemana { max-width: 400px; margin: 0 auto; text-align: center; }";
+    html += "#diasSemana label { margin: 0 5px; }";
+    html += "a { display: block; margin: 30px auto; text-align: center; color: white; background-color: #4CAF50;";
+    html += "padding: 12px 20px; text-decoration: none; border-radius: 8px; max-width: 200px; }";
+    html += "a:hover { background-color: #45a049; }";
+    html += "</style></head><body>";
+
+    html += "<h1>Selecionar Relé e Horário</h1>";
+
+    html += "<label for='releSelect'>Escolha um Relé Configurado:</label>";
+    html += "<select id='releSelect' onchange='atualizarHorarios()'>";
+    html += "<option value=''>-- Selecione --</option>";
+
+    String nomesReles[32];
+    carregarNomesRelesDoSD(nomesReles);  // Sua função que carrega nomes do cartão SD
+
+    html += "<script>let horariosReles = {}; let nomesReles = [];</script>";
+
+    String diasDaSemana[] = {"Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sab"};
+
+    // Para cada relé, adiciona opções e horários no JS
+    for (int i = 0; i < 32; i++) {
+        String horariosStr = "";
+        bool temHorarioValido = false;
+
+        for (int j = 0; j < 15; j++) {
+            int hl = horariosLigar[i][j].hora;
+            int ml = horariosLigar[i][j].minuto;
+            int hd = horariosDesligar[i][j].hora;
+            int md = horariosDesligar[i][j].minuto;
+
+            if (hl != -1 && ml != -1 && hd != -1 && md != -1) {
+                temHorarioValido = true;
+
+                String dias = "";
+                for (int d = 0; d < 7; d++) {
+                    if (horariosLigar[i][j].diasSemana[d]) {
+                        dias += diasDaSemana[d] + ",";
+                    }
+                }
+                if (dias.length() > 0) dias.remove(dias.length() - 1);
+
+                String dadosHorario = String(hl) + "," + String(ml) + "," + String(hd) + "," + String(md) + "," + dias;
+                horariosStr += "'" + dadosHorario + "',";
+            }
+        }
+
+        if (temHorarioValido) {
+            String nome = nomesReles[i].length() > 0 ? nomesReles[i] : "Válvula " + String(i + 1);
+            html += "<option value='" + String(i) + "'>" + nome + "</option>";
+
+            html += "<script>";
+            html += "horariosReles[" + String(i) + "] = [" + horariosStr + "];";
+            html += "nomesReles[" + String(i) + "] = '" + nome + "';";
+            html += "</script>";
+        }
+    }
+
+    html += "</select>";
+
+    html += "<label for='horarioSelect'>Horários do Relé Selecionado:</label>";
+    html += "<select id='horarioSelect' onchange='preencherCampos()'>";
+    html += "<option value=''>-- Selecione um horário --</option>";
+    html += "</select>";
+
+    html += "<label for='campoValvula'>Válvula Selecionada:</label>";
+    html += "<input type='text' id='campoValvula' readonly>";
+
+    html += "<label for='campoHorario'>Horário Selecionado:</label>";
+    html += "<input type='text' id='campoHorario' readonly>";
+
+   html += "<label for='horaLigar'>Hora de Ligar:</label>";
+html += "<input type='time' id='horaLigar' readonly>";
+
+html += "<label for='horaDesligar'>Hora de Desligar:</label>";
+html += "<input type='time' id='horaDesligar' readonly>";
+
+// Dias da semana linha única
+html += "<label>Dias da Semana:</label>";
+html += "<div id='diasSemana' style='text-align:center; white-space: nowrap;'>";
+for (int d = 0; d < 7; d++) {
+    html += "<label style='display: inline-block; margin: 0 10px; cursor: pointer;'>";
+    html += "<input type='checkbox' class='diaSemana' value='" + String(d) + "' disabled style='vertical-align: middle; margin-right: 5px;'>";
+    html += diasDaSemana[d];
+    html += "</label>";
+}
+html += "</div>";
+
+    html += "<label for='atraso'>Atraso (Minutos):</label>";
+    html += "<input type='number' id='atraso' name='atraso' min='0' placeholder='Ex: 10'>";
+
+
+ html += "<h3 style='text-align:center;'>Fertilizantes</h3><div id='fertilizantes' style='max-width:400px; margin:0 auto;'>";
+
+    // Aqui usamos os nomes carregados, se estiverem vazios, mantém "Fertilizante X"
+    for (int i = 1; i <= 10; i++) {
+        String nomeFert = nomesFertilizantes[i - 1];
+        if (nomeFert.length() == 0) {
+            nomeFert = "Fertilizante " + String(i);
+        }
+        html += "<label for='fert" + String(i) + "'>" + nomeFert + ":</label>";
+        html += "<input type='text' id='fert" + String(i) + "' name='fert" + String(i) + "'>";
+    }
+    html += "</div>";
+
+    html += "<button onclick='salvarDados()' ";
+    html += "style='display:block;margin:30px auto;padding:12px 20px;font-size:16px;";
+    html += "background:#4CAF50;color:white;border:none;border-radius:8px;cursor:pointer;";
+    html += "box-shadow:0 4px 6px rgba(0,0,0,0.2);'>Salvar Dados</button>";
+
+    html += "<div id='mensagem' style='display:none; max-width:400px; margin:20px auto; ";
+    html += "padding:15px; border-radius:8px; text-align:center; font-size:16px;'></div>";
+
+
+    // Script para salvar dados via fetch POST
+    html += "<script>";
+    html += "function salvarDados() {";
+    html += "  const rele = document.getElementById('releSelect').value;";
+    html += "  const horario = document.getElementById('horarioSelect').value;";
+    html += "  const horaLigar = document.getElementById('horaLigar').value.split(':');";
+    html += "  const horaDesligar = document.getElementById('horaDesligar').value.split(':');";
+    html += "  const atraso = document.getElementById('atraso').value || '0';";
+
+    html += "  if (rele === '' || horario === '' || horaLigar.length < 2 || horaDesligar.length < 2) { alert('Por favor, preencha todos os campos necessários.'); return; }";
+
+    html += "  let diasSemana = Array.from(document.querySelectorAll('.diaSemana')).map(cb => cb.checked ? '1' : '0');";
+    html += "  let fertilizantes = [];";
+    html += "  for(let i = 1; i <= 10; i++) {";
+    html += "    let val = document.getElementById('fert' + i).value || '0';";
+    html += "    fertilizantes.push(val);";
+    html += "  }";
+
+    html += "  let linha = [parseInt(rele)+1, parseInt(horario)+1, horaLigar[0], horaLigar[1], horaDesligar[0], horaDesligar[1]];";
+    html += "  linha = linha.concat(diasSemana).concat(fertilizantes).concat([atraso]);";
+
+    html += "  fetch('/salvar_dados', {";
+    html += "    method: 'POST',";
+    html += "    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },";
+    html += "    body: 'linha=' + encodeURIComponent(linha.join(','))";
+    html += "  })";
+    html += "  .then(response => response.text())";
+    html += "  .then(msg => alert(msg))";
+    html += "  .catch(err => alert('Erro ao salvar: ' + err));";
+    html += "}";
+    html += "</script>";
+
+    // Funções para atualizar horários e preencher os campos do formulário
+    html += "<script>";
+    html += "function atualizarHorarios() {";
+    html += "  let rele = document.getElementById('releSelect').value;";
+    html += "  let horarioSelect = document.getElementById('horarioSelect');";
+    html += "  horarioSelect.innerHTML = '<option value=\"\">-- Selecione um horário --</option>';";
+    html += "  limparCampos();";
+    html += "  if (rele === '') return;";
+    html += "  let horarios = horariosReles[rele];";
+    html += "  horarios.forEach((h, idx) => {";
+    html += "    let opt = document.createElement('option');";
+    html += "    opt.value = idx;";
+    html += "    opt.text = 'Horário ' + (idx + 1);";
+    html += "    horarioSelect.appendChild(opt);";
+    html += "  });";
+    html += "}";
+
+    html += "function preencherCampos() {";
+    html += "  let rele = document.getElementById('releSelect').value;";
+    html += "  let horarioSelect = document.getElementById('horarioSelect');";
+    html += "  let idx = horarioSelect.value;";
+    html += "  if (rele === '' || idx === '') { limparCampos(); return; }";
+    html += "  let dados = horariosReles[rele][idx].split(',');";
+    html += "  let hl = dados[0].padStart(2, '0');";
+    html += "  let ml = dados[1].padStart(2, '0');";
+    html += "  let hd = dados[2].padStart(2, '0');";
+    html += "  let md = dados[3].padStart(2, '0');";
+    html += "  let dias = dados.slice(4);";
+    html += "  document.getElementById('horaLigar').value = hl + ':' + ml;";
+    html += "  document.getElementById('horaDesligar').value = hd + ':' + md;";
+    html += "  document.getElementById('campoValvula').value = nomesReles[rele];";
+    html += "  document.getElementById('campoHorario').value = 'Horário ' + (parseInt(idx) + 1);";
+    html += "  document.querySelectorAll('.diaSemana').forEach(cb => {";
+    html += "    cb.checked = dias.includes(cb.nextSibling.textContent.trim());";
+    html += "  });";
+    html += "}";
+
+    html += "function limparCampos() {";
+    html += "  document.getElementById('horaLigar').value = '';";
+    html += "  document.getElementById('horaDesligar').value = '';";
+    html += "  document.getElementById('campoValvula').value = '';";
+    html += "  document.getElementById('campoHorario').value = '';";
+    html += "  document.querySelectorAll('.diaSemana').forEach(cb => cb.checked = false);";
+    html += "}";
+    html += "</script>";
+
+    html += "<a href='/'>Voltar para a página inicial</a>";
+    html += "</body></html>";
+
+    request->send(200, "text/html", html);
+});
+
+
+server.on("/salvar_dados", HTTP_POST, [](AsyncWebServerRequest *request){
+    if (!request->hasParam("linha", true)) {
+        request->send(400, "text/plain", "Dados ausentes.");
+        return;
+    }
+
+    String novaLinha = request->getParam("linha", true)->value();
+    
+    // Extrair a chave da nova linha (primeiros 13 campos)
+    std::vector<String> partesNova;
+    int last = 0;
+    for (int i = 0; i < novaLinha.length(); i++) {
+        if (novaLinha[i] == ',') {
+            partesNova.push_back(novaLinha.substring(last, i));
+            last = i + 1;
+        }
+    }
+    partesNova.push_back(novaLinha.substring(last)); // último campo
+
+    if (partesNova.size() < 14) {
+        request->send(400, "text/plain", "Formato de linha inválido.");
+        return;
+    }
+
+    String chaveNova = "";
+    for (int i = 0; i < 13; i++) {
+        chaveNova += partesNova[i] + ",";
+    }
+
+    std::vector<String> linhasExistentes;
+    bool substituido = false;
+
+    // Verifica se o arquivo existe
+    if (SD.exists("/ferti1.txt")) {
+        File file = SD.open("/ferti1.txt", FILE_READ);
+        if (!file) {
+            request->send(500, "text/plain", "Erro ao abrir arquivo para leitura.");
+            return;
+        }
+
+        // Lê todas as linhas existentes
+        while (file.available()) {
+            String linha = file.readStringUntil('\n');
+            linha.trim();
+            if (linha.length() == 0) continue;
+
+            // Comparar chave
+            std::vector<String> partesExistente;
+            int pos = 0;
+            for (int j = 0; j < linha.length(); j++) {
+                if (linha[j] == ',') {
+                    partesExistente.push_back(linha.substring(pos, j));
+                    pos = j + 1;
+                }
+            }
+            partesExistente.push_back(linha.substring(pos));
+
+            String chaveExistente = "";
+            for (int j = 0; j < 13 && j < partesExistente.size(); j++) {
+                chaveExistente += partesExistente[j] + ",";
+            }
+
+            if (chaveExistente == chaveNova) {
+                linhasExistentes.push_back(novaLinha); // substitui
+                substituido = true;
+            } else {
+                linhasExistentes.push_back(linha);
+            }
+        }
+        file.close();
+    }
+
+    // Se não substituiu, adiciona a nova linha
+    if (!substituido) {
+        linhasExistentes.push_back(novaLinha);
+    }
+
+    // Grava o novo conteúdo no arquivo (cria se não existir)
+    File file = SD.open("/ferti1.txt", FILE_WRITE);
+    if (!file) {
+        request->send(500, "text/plain", "Erro ao abrir arquivo para escrita.");
+        return;
+    }
+
+    for (const String &l : linhasExistentes) {
+        file.println(l);
+    }
+    file.close();
+
+    request->send(200, "text/plain", substituido ? "Dados atualizados!" : "Dados salvos com sucesso!");
+    carregarAgendamentosProximaHora();
+});
+
+
+
+
+
+
+// Calibração Fertirrigação
+server.on("/calibracao", HTTP_GET, [](AsyncWebServerRequest *request) {
+
+    // Carrega os nomes dos fertilizantes
+    String nomesFertilizantes[10];
+    carregarNomesFertilizantesDoSD(nomesFertilizantes);
+
+    String html = "<html><head>";
+    html += "<meta charset='UTF-8'>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+    html += "<style>";
+    html += "body { font-family: Arial; background: #f4f4f4; padding: 20px; text-align:center; }";
+    html += "h1 { color: #4CAF50; }";
+    html += "form { max-width: 400px; margin: auto; background: #fff; padding: 20px; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }";
+    html += "label { font-weight: bold; display:block; margin-bottom:5px; text-align:center; }";
+    html += "input[type='number'] { width: 100%; padding: 8px; margin-bottom: 12px; border: 1px solid #ccc; border-radius: 4px; font-size:14px; }";
+    html += "button { background-color: #4CAF50; color: white; padding: 10px; border: none; border-radius: 4px; width: 100%; font-size: 16px; cursor:pointer; }";
+    html += "button:hover { background-color: #45a049; }";
+    html += "#mensagem { margin-top:20px; font-size:16px; color:#4CAF50; }";
+    html += "#botaoVoltar { display:none; margin-top:10px; padding:10px 20px; background:#4CAF50; color:white; text-decoration:none; border-radius:5px; }";
+    html += "#botaoVoltar:hover { background:#45a049; }";
+    html += "</style>";
+    html += "<script>";
+    html += "function salvarCalibracaoAjax(event) {";
+    html += "event.preventDefault();";
+    html += "var xhr = new XMLHttpRequest();";
+    html += "var form = document.getElementById('formCalibracao');";
+    html += "var params = '';";
+    html += "for(var i=0;i<10;i++){";
+    html += "params += 'f'+i+'=' + encodeURIComponent(form['f'+i].value) + '&';";
+    html += "}";
+    html += "xhr.open('GET', '/salvar_calibracao?' + params, true);";
+    html += "xhr.onreadystatechange = function() {";
+    html += "if(xhr.readyState == 4 && xhr.status == 200){";
+    html += "document.getElementById('mensagem').innerHTML='Calibração salva com sucesso!';";
+    html += "document.getElementById('botaoVoltar').style.display='inline-block';";
+    html += "}";
+    html += "};";
+    html += "xhr.send();";
+    html += "}";
+    html += "</script>";
+    html += "</head><body>";
+
+    html += "<h1>Calibração de Adubos</h1>";
+    html += "<form id='formCalibracao' onsubmit='salvarCalibracaoAjax(event)'>";
+
+    for (int i = 0; i < 10; i++) {
+        String nomeFert = nomesFertilizantes[i];
+        if (nomeFert.length() == 0) nomeFert = "Fertilizante " + String(i + 1);
+        html += "<label for='f" + String(i) + "'>Fator - " + nomeFert + ":</label>";
+        html += "<input type='number' id='f" + String(i) + "' name='f" + String(i) + "' value='" + String(fatorCalibracao[i]) + "' required>";
+    }
+
+    html += "<button type='submit'>Salvar Calibração</button>";
+    html += "</form>";
+    html += "<div id='mensagem'></div>";
+    html += "<a id='botaoVoltar' href='/' >Voltar para página inicial</a>";
+    html += "</body></html>";
+
+    request->send(200, "text/html", html);
+});
+
+
+
+server.on("/salvar_calibracao", HTTP_GET, [](AsyncWebServerRequest *request) {
+  // Lê os valores enviados e atualiza o vetor
+  for (int i = 0; i < 10; i++) {
+    if (request->hasParam("f" + String(i))) {
+      fatorCalibracao[i] = request->getParam("f" + String(i))->value().toInt();
+    }
+  }
+
+  // Salva os dados no cartão SD
+  File file = SD.open("/calibracao.txt", FILE_WRITE);
+  if (file) {
+    for (int i = 0; i < 10; i++) {
+      file.println(fatorCalibracao[i]);
+    }
+    file.close();
+    request->send(200, "text/plain", "Calibração salva com sucesso! <a href='/calibracao'>Voltar</a>");
+  } else {
+    request->send(500, "text/plain", "Erro ao salvar calibração no SD.");
+  }
+  carregarCalibracaoDoSD();
+
+});
+
+
+
+server.on("/gerenciar_agendamentos", HTTP_GET, [](AsyncWebServerRequest *request) {
+  String html = "<html><head>";
+  html += "<meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<style>";
+  html += "body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f4f4f4; }";
+  html += "h1 { color: #4CAF50; text-align: center; font-size: 28px; margin-bottom: 20px; }";
+  html += "table { width: 100%; border-collapse: collapse; margin: 20px 0; text-align: center; }";
+  html += "table, th, td { border: 1px solid #ddd; }";
+  html += "th, td { text-align: center; padding: 12px; font-size: 16px; }";
+  html += "th { background-color: #4CAF50; color: white; position: sticky; top: 0; }";
+  html += "tr:nth-child(even) { background-color: #f9f9f9; }";
+  html += "tr:hover { background-color: #f1f1f1; }";
+  html += "a { display: block; margin: 20px auto; padding: 15px; text-align: center; color: white; background-color: #4CAF50; text-decoration: none; border-radius: 8px; font-size: 18px; max-width: 300px; }";
+  html += "a:hover { background-color: #45a049; }";
+  html += "@media (max-width: 600px) {";
+  html += "body { padding: 10px; }";
+  html += "h1 { font-size: 24px; }";
+  html += "th, td { font-size: 14px; padding: 10px; }";
+  html += "a { font-size: 16px; padding: 12px; width: 90%; }";
+  html += "}";
+  html += "</style></head><body>";
+  html += "<h1>Gerenciar Agendamentos por Válvula</h1>";
+
+  String nomesReles[32];
+  carregarNomesRelesDoSD(nomesReles);
+
+  String nomesFertilizantes[10];
+  carregarNomesFertilizantesDoSD(nomesFertilizantes); // Função que lê os nomes do SD
+
+  if (SD.exists("/ferti1.txt")) {
+    File file = SD.open("/ferti1.txt");
+    if (file) {
+      std::vector<String> linhas[32];
+
+      while (file.available()) {
+        String linha = file.readStringUntil('\n');
+        linha.trim();
+        if (linha.length() == 0) continue;
+
+        std::vector<String> partes;
+        int pos = 0;
+        for (int i = 0; i < linha.length(); i++) {
+          if (linha[i] == ',') {
+            partes.push_back(linha.substring(pos, i));
+            pos = i + 1;
+          }
+        }
+        partes.push_back(linha.substring(pos));
+
+        if (partes.size() >= 24) {
+          int releIdx = partes[0].toInt() - 1;
+          if (releIdx >= 0 && releIdx < 32) {
+            linhas[releIdx].push_back(linha);
+          }
+        }
+      }
+      file.close();
+
+      String diasSemana[] = {"Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sab"};
+
+      for (int i = 0; i < 32; i++) {
+        if (linhas[i].size() == 0) continue;
+
+        String titulo = "Válvula " + String(i + 1);
+        if (nomesReles[i].length() > 0) titulo += " - " + nomesReles[i];
+
+        html += "<table>";
+        html += "<tr><th colspan='5'>" + titulo + "</th></tr>";
+        html += "<tr><th>#</th><th>Hora</th><th>Dias</th><th>Fertilizantes</th><th>Atraso</th></tr>";
+
+        for (int j = 0; j < linhas[i].size(); j++) {
+          std::vector<String> partes;
+          String linha = linhas[i][j];
+          int pos = 0;
+          for (int k = 0; k < linha.length(); k++) {
+            if (linha[k] == ',') {
+              partes.push_back(linha.substring(pos, k));
+              pos = k + 1;
+            }
+          }
+          partes.push_back(linha.substring(pos));
+
+          String horaLigar = partes[2] + ":" + partes[3];
+
+          String dias = "";
+          for (int d = 0; d < 7; d++) {
+            if (partes[6 + d] == "1") dias += diasSemana[d] + " ";
+          }
+
+          String ferts = "";
+          for (int f = 0; f < 10; f++) {
+            String nomeFert = nomesFertilizantes[f].length() > 0 ? nomesFertilizantes[f] : "Fertilizante " + String(f + 1);
+            ferts += nomeFert + ": " + partes[13 + f] + "<br>";
+          }
+
+          String atraso = partes[23];
+
+          html += "<tr>";
+          html += "<td>" + String(j + 1) + "</td>";
+          html += "<td>" + horaLigar + "</td>";
+          html += "<td>" + dias + "</td>";
+          html += "<td>" + ferts + "</td>";
+          html += "<td>" + atraso + "min</td>";
+          html += "</tr>";
+        }
+
+        html += "</table>";
+      }
+    } else {
+      html += "<p>Erro ao abrir o arquivo de agendamentos.</p>";
+    }
+  } else {
+    html += "<p>Nenhum agendamento encontrado.</p>";
+  }
+
+  html += "<a href='/fertirrigação'>Adicionar Novo Agendamento</a>";
+  html += "<a href='/'>Voltar à Página Inicial</a>";
+  html += "</body></html>";
+
+  request->send(200, "text/html", html);
+});
+
+
+
+
+
+server.on("/nomes_fertilizantes", HTTP_GET, [](AsyncWebServerRequest *request) {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<style>";
+  html += "body { font-family: Arial, sans-serif; background:#f4f4f4; margin:0; padding:20px; display:flex; justify-content:center; }";
+  html += ".container { background:white; padding:30px; border-radius:12px; box-shadow:0 4px 12px rgba(0,0,0,0.15); width:100%; max-width:500px; margin-bottom:40px; }";
+  html += "h1 { text-align:center; color:#4CAF50; margin-bottom:20px; font-size:24px; }";
+  html += "label { font-size:14px; color:#333; margin-top:10px; display:block; text-align:left; }";
+  html += "input[type='text'] { width:100%; padding:10px; margin:8px 0; border-radius:6px; border:1px solid #ccc; font-size:14px; }";
+  html += "button { width:100%; background-color:#4CAF50; color:white; padding:12px; border:none; border-radius:8px; font-size:16px; cursor:pointer; margin-top:15px; transition:0.3s; }";
+  html += "button:hover { background-color:#45a049; }";
+  html += "#mensagem { display:none; margin-top:15px; padding:12px; border-radius:8px; text-align:center; font-size:14px; }";
+  html += "a { display:block; text-align:center; margin-top:20px; text-decoration:none; color:#4CAF50; font-size:14px; }";
+  html += "</style></head><body>";
+
+  html += "<div class='container'>";
+  html += "<h1>Gerenciar Nomes dos Fertilizantes</h1>";
+
+  // Carrega nomes do arquivo
+  String nomes[10];
+  File file = SD.open("/nomes_fert.txt", FILE_READ);
+  if (file) {
+    int i = 0;
+    while (file.available() && i < 10) {
+      nomes[i++] = file.readStringUntil('\n');
+    }
+    file.close();
+  }
+
+  html += "<form id='formNomes'>";
+  for (int i = 0; i < 10; i++) {
+    String nome = nomes[i];
+    nome.trim();
+    html += "<label>Fertilizante " + String(i + 1) + ":</label>";
+    html += "<input type='text' name='f" + String(i) + "' value='" + nome + "'>";
+  }
+  html += "<button type='button' onclick='salvar()'>Salvar Nomes</button>";
+  html += "<div id='mensagem'></div>";
+  html += "</form>";
+
+  html += "<a href='/'>Voltar para a página inicial</a>";
+  html += "</div>";
+
+  // Script JS
+  html += "<script>";
+  html += "function mostrarMensagem(texto, sucesso=true) {";
+  html += "  let msg = document.getElementById('mensagem');";
+  html += "  msg.style.display = 'block';";
+  html += "  msg.innerText = texto;";
+  html += "  msg.style.backgroundColor = sucesso ? '#d4edda' : '#f8d7da';";
+  html += "  msg.style.color = sucesso ? '#155724' : '#721c24';";
+  html += "  msg.style.border = sucesso ? '1px solid #c3e6cb' : '1px solid #f5c6cb';";
+  html += "  setTimeout(() => { msg.style.display = 'none'; }, 4000);";
+  html += "}";
+
+  html += "function salvar() {";
+  html += "  const form = document.getElementById('formNomes');";
+  html += "  const data = new FormData(form);";
+  html += "  fetch('/salvar_nomes_fert', { method: 'POST', body: new URLSearchParams(data) })";
+  html += "    .then(r => r.text()).then(t => mostrarMensagem('✅ ' + t, true))";
+  html += "    .catch(e => mostrarMensagem('Erro: ' + e, false));";
+  html += "}";
+  html += "</script>";
+
+  html += "</body></html>";
+
+  request->send(200, "text/html", html);
+});
+
+
+server.on("/salvar_nomes_fert", HTTP_POST, [](AsyncWebServerRequest *request){
+  File file = SD.open("/nomes_fert.txt", FILE_WRITE);
+  if (!file) {
+    request->send(500, "text/plain", "Erro ao abrir arquivo para escrita.");
+    return;
+  }
+
+  for (int i = 0; i < 10; i++) {
+    String param = "f" + String(i);
+    String nome = request->hasParam(param, true) ? request->getParam(param, true)->value() : "";
+    file.println(nome);
+  }
+  file.close();
+
+  request->send(200, "text/plain", "Nomes salvos com sucesso!");
+});
+
+
+
+
+server.on("/parâmetros_fertirrigação", HTTP_GET, [](AsyncWebServerRequest *request) {
+
+    // --- Lê sensores ---
+    float umidade1 = lerUmidadeSolo1();
+    float umidade2 = lerUmidadeSolo2();
+    float umidade3 = lerUmidadeSolo3();
+
+    float umidadeMedia = (umidade1 + umidade2 + umidade3) / 3.0;
+
+    String html = "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+    html += "<style>";
+    html += "body { font-family: Arial; background:#f9f9f9; text-align:center; }";
+    html += ".card { background:#fff; border:1px solid #ddd; padding:15px; margin:10px auto; display:block; border-radius:10px; box-shadow:0 2px 5px rgba(0,0,0,0.2); max-width:300px; }";
+    html += "label { display:block; margin-bottom:5px; font-weight:bold; text-align:center; }";
+    html += "input { padding:8px; border-radius:6px; border:1px solid #ccc; width:100%; text-align:center; margin-bottom:15px; box-sizing:border-box; }";
+    html += "button { padding:10px 20px; background:#4CAF50; color:#fff; border:none; border-radius:8px; cursor:pointer; font-size:16px; }";
+    html += "#mensagem { margin-top:20px; font-size:18px; color:#4CAF50; }";
+    html += "</style>";
+    html += "<script>";
+    
+    // Carregar valores do /config_json
+    html += "function carregarConfig(){";
+    html += "fetch('/config_json').then(r=>r.json()).then(cfg=>{";
+    html += "document.getElementById('pausa').value = cfg.pausa;";
+    html += "document.getElementById('retorno').value = cfg.retorno;";
+    html += "document.getElementById('minimo').value = cfg.minimo;";
+    html += "document.getElementById('maximo').value = cfg.maximo;";
+    html += "document.getElementById('mistura').value = cfg.mistura;";
+    html += "});}";
+    
+    // Salvar config via AJAX
+    html += "function salvarConfigAjax(event){";
+    html += "event.preventDefault();";
+    html += "var form=document.getElementById('formConfig');";
+    html += "var params='pausa='+form.pausa.value+'&retorno='+form.retorno.value+'&minimo='+form.minimo.value+'&maximo='+form.maximo.value+'&mistura='+form.mistura.value;";
+    html += "fetch('/salvar?'+params).then(r=>r.text()).then(msg=>{";
+    html += "document.getElementById('mensagem').innerHTML=msg;";
+    html += "document.getElementById('botaoVoltar').style.display='inline-block';";
+    html += "carregarConfig();";
+    html += "});}";
+    
+    html += "window.onload=carregarConfig;";
+    html += "</script>";
+    html += "</head><body>";
+
+    html += "<h1>Configuração do Sistema</h1>";
+
+    // --- Leituras dos sensores ---
+    html += "<div style='text-align:center; margin-top:20px;'>";
+    html += "<div class='card' style='display:inline-block; font-size:14px; width:100px; margin:5px;'><h3>Umidade 1 (0-10)</h3><p>" + String(umidade1) + "%</p></div>";
+    html += "<div class='card' style='display:inline-block; font-size:14px; width:100px; margin:5px;'><h3>Umidade 2 (10-20)</h3><p>" + String(umidade2) + "%</p></div>";
+    html += "<div class='card' style='display:inline-block; font-size:14px; width:100px; margin:5px;'><h3>Umidade 3 (20-30)</h3><p>" + String(umidade3) + "%</p></div>";
+    html += "<div class='card' style='display:inline-block; font-size:14px; width:100px; margin:5px;'><h3>Média (Umidade)</h3><p>" + String(umidadeMedia) + "%</p></div>";
+    html += "</div>";
+
+    // --- Formulário com step 0.01 ---
+    html += "<form id='formConfig' onsubmit='salvarConfigAjax(event)'>";
+    html += "<div class='card' style='width:200px;'><label>Pausa antes da ferti (min)</label><input type='number' step='0.01' id='pausa' name='pausa'></div>";
+    html += "<div class='card' style='width:200px;'><label>Retorno após ferti (min)</label><input type='number' step='0.01' id='retorno' name='retorno'></div>";
+    html += "<div class='card' style='width:200px;'><label>Umidade Mínima</label><input type='number' step='0.01' id='minimo' name='minimo'></div>";
+    html += "<div class='card' style='width:200px;'><label>Umidade Máxima</label><input type='number' step='0.01' id='maximo' name='maximo'></div>";
+    html += "<div class='card' style='width:200px;'><label>Tempo Mistura</label><input type='number' step='0.01' id='mistura' name='mistura'></div>";
+    html += "<button type='submit'>Salvar</button>";
+    html += "</form>";
+
+    html += "<div id='mensagem'></div>";
+    html += "<a id='botaoVoltar' href='/' style='display:none; margin-top:20px; padding:10px 20px; background:#4CAF50; color:white; text-decoration:none; border-radius:5px;'>Voltar para página inicial</a>";
+
+    html += "</body></html>";
+
+    request->send(200, "text/html", html);
+});
+
+
+
+server.on("/config_json", HTTP_GET, [](AsyncWebServerRequest *request) {
+    carregarConfigDoSD();
+    String json = "{";
+    json += "\"pausa\":" + String(atraso_da_pausa, 2) + ",";
+    json += "\"retorno\":" + String(atraso_do_retorno, 2) + ",";
+    json += "\"minimo\":" + String(valor_minimo, 2) + ",";
+    json += "\"maximo\":" + String(valor_maximo, 2) + ",";
+    json += "\"mistura\":" + String(minutos_misturando, 2);
+    json += "}";
+    request->send(200, "application/json", json);
+});
+
+  // ==========================
+  // ENDPOINT SALVAR
+  // ==========================
+server.on("/salvar", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (request->hasParam("pausa")) atraso_da_pausa = request->getParam("pausa")->value().toFloat();
+    if (request->hasParam("retorno")) atraso_do_retorno = request->getParam("retorno")->value().toFloat();
+    if (request->hasParam("minimo")) valor_minimo = request->getParam("minimo")->value().toFloat();
+    if (request->hasParam("maximo")) valor_maximo = request->getParam("maximo")->value().toFloat();
+    if (request->hasParam("mistura")) minutos_misturando = request->getParam("mistura")->value().toFloat();
+
+    salvarConfigNoSD();
+    request->send(200, "text/plain", "Configuração salva com sucesso!");
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/////////////////////////////////////////////////////Página para apagar um horário específico de um relé/////////////////////////////////////////////////////////////////////////////////
+server.on("/apagar_horario", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String html = "<html><head>";
+    html += "<meta charset='UTF-8'>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+    html += "<style>";
+    html += "body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f4f4f4; text-align: center; }";
+    html += "h1 { color: #4CAF50; font-size: 28px; margin-bottom: 20px; }";
+    html += "form { max-width: 400px; margin: 0 auto 20px auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2); }";
+    html += "label { display: block; margin-bottom: 8px; font-weight: bold; font-size: 16px; }";
+    html += "select, input[type='submit'] { width: 100%; padding: 12px; margin-bottom: 20px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; font-size: 16px; }";
+    html += "input[type='submit'] { background-color: #4CAF50; color: white; cursor: pointer; font-size: 18px; }";
+    html += "input[type='submit']:hover { background-color: #45a049; }";
+    html += "a { display: inline-block; margin-top: 20px; padding: 12px 24px; color: white; background-color: #4CAF50; text-decoration: none; border-radius: 5px; font-size: 18px; }";
+    html += "a:hover { background-color: #45a049; }";
+    html += "</style></head><body>";
+    html += "<h1>Apagar Horário de um Relé</h1>";
+    html += "<form action='/apagar_horario_exec' method='GET'>";
+
+    // Seleção do relé
+    html += "<label for='rele'>Escolha a Válvula:</label>";
+    html += "<select name='rele' id='rele' required>";
+    String nomesReles[32];
+    carregarNomesRelesDoSD(nomesReles);
+    for (int i = 0; i < 32; i++) {
+        String nome = nomesReles[i];
+        String opcao = String(i + 1);
+        if (nome.length() > 0) {
+            opcao += " - " + nome;
+        }
+        html += "<option value='" + String(i + 1) + "'>" + opcao + "</option>";
+    }
+    html += "</select>";
+
+    // Seleção do horário
+    html += "<label for='horario'>Escolha o Horário (1 a 15):</label>";
+    html += "<select name='horario' id='horario' required>";
+    for (int j = 1; j <= 15; j++) {
+        html += "<option value='" + String(j) + "'>Horário " + String(j) + "</option>";
+    }
+    html += "</select>";
+
+    html += "<input type='submit' value='Apagar Horário'>";
+    html += "</form>";
+    html += "<div><a href='/'>Voltar para a página inicial</a></div>";
+    html += "</body></html>";
+
+    request->send(200, "text/html", html);
+});
+
+server.on("/apagar_horario_exec", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (request->hasParam("rele") && request->hasParam("horario")) {
+        int releEscolhido = request->getParam("rele")->value().toInt();
+        int horarioEscolhido = request->getParam("horario")->value().toInt();
+
+        if (releEscolhido >= 1 && releEscolhido <= 32 && horarioEscolhido >= 1 && horarioEscolhido <= 15) {
+            apagarLinhaHorario(releEscolhido - 1, horarioEscolhido - 1); // usa índices base 0
+
+            String html = "<html><head>";
+            html += "<meta charset='UTF-8'>";
+            html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+            html += "<style>";
+            html += "body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f4f4f4; text-align: center; }";
+            html += "h1 { color: #4CAF50; font-size: 28px; margin-bottom: 20px; }";
+            html += "a { display: inline-block; margin-top: 20px; padding: 12px 24px; color: white; background-color: #4CAF50; text-decoration: none; border-radius: 5px; font-size: 18px; max-width: 300px; width: 100%; }";
+            html += "a:hover { background-color: #45a049; }";
+            html += "</style>";
+            html += "</head><body>";
+            html += "<h1>Horário apagado com sucesso!</h1>";
+            html += "<a href='/'>Voltar para a página inicial</a>";
+            html += "</body></html>";
+
+            request->send(200, "text/html", html);
+        } else {
+            request->send(400, "text/html", "<h1>Parâmetros inválidos. Tente novamente.</h1><a href='/'>Voltar</a>");
+        }
+    } else {
+        request->send(400, "text/html", "<h1>Faltam parâmetros na solicitação.</h1><a href='/'>Voltar</a>");
+    }
+});
+
+
+
+
+
+
+
+server.on("/verificacao", HTTP_GET, [](AsyncWebServerRequest *request) {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<style>";
+  html += "body { font-family: Arial, sans-serif; background:#f4f4f4; margin:0; padding:20px; display:flex; justify-content:center; }";
+  html += ".container { background:white; padding:30px; border-radius:12px; box-shadow:0 4px 12px rgba(0,0,0,0.15); width:100%; max-width:500px; }";
+  html += "h1 { text-align:center; color:#2196F3; margin-bottom:20px; font-size:24px; }";
+  html += "label { font-size:14px; color:#333; margin-top:10px; display:block; text-align:left; }";
+  html += "input[type='text'] { width:100%; padding:10px; margin:8px 0; border-radius:6px; border:1px solid #ccc; font-size:14px; letter-spacing:1px; text-align:center; }";
+  html += "button { width:100%; background-color:#2196F3; color:white; padding:12px; border:none; border-radius:8px; font-size:16px; cursor:pointer; margin-top:15px; transition:0.3s; }";
+  html += "button:hover { background-color:#1976D2; }";
+  html += "#mensagem { display:none; margin-top:15px; padding:12px; border-radius:8px; text-align:center; font-size:14px; }";
+  html += "a { display:block; text-align:center; margin-top:20px; text-decoration:none; color:#2196F3; font-size:14px; }";
+  html += "</style></head><body>";
+
+  html += "<div class='container'>";
+  html += "<h1>Gerenciar Horários</h1>";
+
+  String horarios[8];
+
+  File file = SD.open("/verificacao.txt", FILE_READ);
+  if (file) {
+    int i = 0;
+    while (file.available() && i < 8) {
+      horarios[i++] = file.readStringUntil('\n');
+    }
+    file.close();
+  }
+
+  html += "<form id='formHorarios'>";
+  for (int i = 0; i < 8; i++) {
+    horarios[i].trim();
+    html += "<label>Horário " + String(i + 1) + " (HH:MM):</label>";
+    html += "<input type='text' maxlength='5' placeholder='00:00' class='hora' name='h" + String(i) + "' value='" + horarios[i] + "'>";
+  }
+
+  html += "<button type='button' onclick='salvar()'>Salvar Horários</button>";
+  html += "<div id='mensagem'></div>";
+  html += "</form>";
+
+  html += "<a href='/'>Voltar</a>";
+  html += "</div>";
+
+  html += "<script>";
+
+  // ---------------- MÁSCARA HH:MM ----------------
+  html += "document.querySelectorAll('.hora').forEach(function(campo){";
+
+  html += "campo.addEventListener('input', function(){";
+  html += "  let v = this.value.replace(/[^0-9]/g,'');";
+  html += "  if(v.length>=3){ this.value = v.substring(0,2)+':'+v.substring(2,4); }";
+  html += "  else if(v.length>=1){ this.value = v; }";
+  html += "});";
+
+  html += "campo.addEventListener('keydown', function(e){";
+  html += "  if(e.key==='Backspace' && this.selectionStart===3){";
+  html += "    e.preventDefault();";
+  html += "    this.value=this.value.substring(0,2)+':';";
+  html += "  }";
+  html += "});";
+
+  html += "});";
+  // ------------------------------------------------
+
+  html += "function mostrarMensagem(txt, ok=true){";
+  html += " let m=document.getElementById('mensagem');";
+  html += " m.style.display='block';";
+  html += " m.innerText=txt;";
+  html += " m.style.backgroundColor=ok?'#d4edda':'#f8d7da';";
+  html += " m.style.color=ok?'#155724':'#721c24';";
+  html += " m.style.border=ok?'1px solid #c3e6cb':'1px solid #f5c6cb';";
+  html += " setTimeout(()=>{m.style.display='none';},4000);";
+  html += "}";
+
+  html += "function salvar(){";
+  html += " const f=document.getElementById('formHorarios');";
+  html += " const d=new FormData(f);";
+  html += " fetch('/salvar_horarios',{method:'POST',body:new URLSearchParams(d)})";
+  html += " .then(r=>r.text()).then(t=>mostrarMensagem('✔ '+t,true))";
+  html += " .catch(e=>mostrarMensagem('Erro: '+e,false));";
+  html += "}";
+  html += "</script>";
+
+  html += "</body></html>";
+
+  request->send(200, "text/html", html);
+});
+
+
+
+
+
+
+
+server.on("/salvar_horarios", HTTP_POST, [](AsyncWebServerRequest *request){
+
+  String linhas[8];
+
+  File file = SD.open("/verificacao.txt", FILE_READ);   // << ALTERADO
+  if (file) {
+    int i = 0;
+    while (file.available() && i < 8) {
+      linhas[i++] = file.readStringUntil('\n');
+    }
+    file.close();
+  }
+
+  for (int i = 0; i < 8; i++) {
+    String param = "h" + String(i);
+    if (request->hasParam(param, true)) {
+      linhas[i] = request->getParam(param, true)->value();
+      linhas[i].trim();
+    }
+  }
+
+  file = SD.open("/verificacao.txt", FILE_WRITE);   // << ALTERADO
+  if (!file) {
+    request->send(500, "text/plain", "Erro ao abrir arquivo.");
+    return;
+  }
+
+  for (int i = 0; i < 8; i++) {
+    file.println(linhas[i]);
+  }
+
+  file.close();
+
+  request->send(200, "text/plain", "Horários salvos com sucesso.");
+  carregarHorarios();
+});
+
+
+
+
+    // Inicia o servidor
+    server.begin();
+
+
+    
+}
+
+
+
+
+
+
+
+
+
+
+
+
+float lerUmidadeSolo12() {
+// --- Valores de calibração do sensor (entrada) ---
+int valorAr        = 1141;
+int valorSeco      = 1333;
+int valorUmido     = 2313;
+int valorSaturado  = 2677;
+int valorAgua      = 2939;
+
+// --- Valores de saída mapeados (percentual ou escala customizada) ---
+int calculoAr        = -1;
+int calculoSeco      = 0;
+int calculoUmido     = 1822;
+int calculoSaturado  = 1971;
+int calculoAgua      = 10000;
+
+  // --- Média de leituras ---
+  int amostras = 100;
+  long acumulada = 0;
+  for (int i = 0; i < amostras; i++) {
+    acumulada += analogRead(35);
+  }
+  int media = acumulada / amostras;
+
+  // --- Inverte a leitura (opcional, depende do sensor) ---
+  int leitura = abs(media - 4095); // - 4095
+
+float umidade;
+
+if (leitura < valorSeco) {
+  // Menor que o solo seco → retorna -1
+  umidade = -1;
+}
+else if (leitura >= valorSeco && leitura <= valorUmido) {
+  // Entre seco e úmido
+  umidade = map(leitura, valorSeco, valorUmido, calculoSeco, calculoUmido);
+}
+else if (leitura > valorUmido && leitura <= valorSaturado) {
+  // Entre úmido e saturado
+  umidade = map(leitura, valorUmido, valorSaturado, calculoUmido, calculoSaturado);
+}
+else if (leitura > valorSaturado && leitura <= valorAgua) {
+  // Entre saturado e água
+  umidade = map(leitura, valorSaturado, valorAgua, calculoSaturado, calculoAgua);
+}
+else {
+  // Maior que água → trava no valor máximo
+  umidade = calculoAgua;
+}
+
+  return leitura;
+}
+
+
+
+
+
+
+float lerUmidadeSolo22() {
+// --- Valores de calibração do sensor (entrada) ---
+int valorAr        = 1141;
+int valorSeco      = 1333;
+int valorUmido     = 2313;
+int valorSaturado  = 2677;
+int valorAgua      = 2939;
+
+// --- Valores de saída mapeados (percentual ou escala customizada) ---
+int calculoAr        = -1;
+int calculoSeco      = 0;
+int calculoUmido     = 1822;
+int calculoSaturado  = 1971;
+int calculoAgua      = 10000;
+
+  // --- Média de leituras ---
+  int amostras = 100;
+  long acumulada = 0;
+  for (int i = 0; i < amostras; i++) {
+    acumulada += analogRead(32);
+  }
+  int media = acumulada / amostras;
+
+  // --- Inverte a leitura (opcional, depende do sensor) ---
+  int leitura = abs(media - 4095); // - 4095
+
+float umidade;
+
+if (leitura < valorSeco) {
+  // Menor que o solo seco → retorna -1
+  umidade = -1;
+}
+else if (leitura >= valorSeco && leitura <= valorUmido) {
+  // Entre seco e úmido
+  umidade = map(leitura, valorSeco, valorUmido, calculoSeco, calculoUmido);
+}
+else if (leitura > valorUmido && leitura <= valorSaturado) {
+  // Entre úmido e saturado
+  umidade = map(leitura, valorUmido, valorSaturado, calculoUmido, calculoSaturado);
+}
+else if (leitura > valorSaturado && leitura <= valorAgua) {
+  // Entre saturado e água
+  umidade = map(leitura, valorSaturado, valorAgua, calculoSaturado, calculoAgua);
+}
+else {
+  // Maior que água → trava no valor máximo
+  umidade = calculoAgua;
+}
+
+  return leitura;
+}
+
+
+
+
+
+
+
+
+float lerUmidadeSolo32() {
+// --- Valores de calibração do sensor (entrada) ---
+int valorAr        = 1141;
+int valorSeco      = 1333;
+int valorUmido     = 2313;
+int valorSaturado  = 2677;
+int valorAgua      = 2939;
+
+// --- Valores de saída mapeados (percentual ou escala customizada) ---
+int calculoAr        = -1;
+int calculoSeco      = 0;
+int calculoUmido     = 1822;
+int calculoSaturado  = 1971;
+int calculoAgua      = 10000;
+
+  // --- Média de leituras ---
+  int amostras = 100;
+  long acumulada = 0;
+  for (int i = 0; i < amostras; i++) {
+    acumulada += analogRead(33);
+  }
+  int media = acumulada / amostras;
+
+  // --- Inverte a leitura (opcional, depende do sensor) ---
+  int leitura = abs(media - 4095); // - 4095
+
+float umidade;
+
+if (leitura < valorSeco) {
+  // Menor que o solo seco → retorna -1
+  umidade = -1;
+}
+else if (leitura >= valorSeco && leitura <= valorUmido) {
+  // Entre seco e úmido
+  umidade = map(leitura, valorSeco, valorUmido, calculoSeco, calculoUmido);
+}
+else if (leitura > valorUmido && leitura <= valorSaturado) {
+  // Entre úmido e saturado
+  umidade = map(leitura, valorUmido, valorSaturado, calculoUmido, calculoSaturado);
+}
+else if (leitura > valorSaturado && leitura <= valorAgua) {
+  // Entre saturado e água
+  umidade = map(leitura, valorSaturado, valorAgua, calculoSaturado, calculoAgua);
+}
+else {
+  // Maior que água → trava no valor máximo
+  umidade = calculoAgua;
+}
+
+  return leitura;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+void chave_mestra_ativar(int porta) {
+  if (porta >= 100 && porta < 200) {
+    // PCF8575_1
+    int pino = porta - 100;
+    pcf8575_1.digitalWrite(pino, LOW);
+  }
+  else if (porta >= 200 && porta < 300) {
+    // PCF8575_2
+    int pino = porta - 200;
+    pcf8575_2.digitalWrite(pino, LOW);
+  }
+  else {
+    // GPIO direto do ESP32
+    digitalWrite(porta, LOW);
+  }
+}
+
+void chave_mestra_desativar(int porta) {
+  if (porta >= 100 && porta < 200) {
+    // PCF8575_1
+    int pino = porta - 100;
+    pcf8575_1.digitalWrite(pino, HIGH);
+  }
+  else if (porta >= 200 && porta < 300) {
+    // PCF8575_2
+    int pino = porta - 200;
+    pcf8575_2.digitalWrite(pino, HIGH);
+  }
+  else {
+    // GPIO direto do ESP32
+    digitalWrite(porta, HIGH);
+  }
+}
+
+
+
+bool existeValvulaHorarioLigada() {
+  for (int i = 0; i < 32; i++) {
+    if (estadoRele[i] == LOW) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool existeFertiAtiva() {
+  for (int i = 0; i < 10; i++) {
+    if (relesLigados[i]) {
+      return true;
+    }
+  }
+  return false;
+}
+bool existeAgendamentoAtivo() {
+  return existeValvulaHorarioLigada() || existeFertiAtiva();
+}
+
+
+
+void carregarHorarios() {
+  for (int i = 0; i < 8; i++) horarios[i] = "";
+
+  File file = SD.open("/verificacao.txt", FILE_READ);
+  if (!file) {
+    Serial.println("Erro ao abrir /verificacao.txt");
+    return;
+  }
+
+  int i = 0;
+  while (file.available() && i < 8) {
+    horarios[i] = file.readStringUntil('\n');
+    horarios[i].trim();
+    i++;
+  }
+
+  file.close();
+
+  Serial.println("Horarios carregados:");
+  for (int j = 0; j < 8; j++) {
+    Serial.println(horarios[j]);
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+///////////////////////////////// comunicador com servidor ///////////////////////////////
+
+bool atualizarLinhaSD(const char *path, int linhaAlvo, String novaLinha) {
+    File original = SD.open(path, FILE_READ);
+    if (!original) {
+        Serial.println("Erro ao abrir arquivo original");
+        return false;
+    }
+
+    File temp = SD.open("/temp.txt", FILE_WRITE);
+    if (!temp) {
+        Serial.println("Erro ao criar temp.txt");
+        original.close();
+        return false;
+    }
+
+    int linhaAtual = 1;
+
+    while (original.available()) {
+        String linha = original.readStringUntil('\n');
+        linha.trim();
+
+        if (linhaAtual == linhaAlvo) {
+            // 🔒 mantém estrutura EXACTA
+            temp.println(novaLinha);
+        } else {
+            temp.println(linha);
+        }
+
+        linhaAtual++;
+    }
+
+    original.close();
+    temp.close();
+
+    SD.remove(path);
+    SD.rename("/temp.txt", path);
+
+    Serial.println("Linha atualizada com sucesso");
+    return true;
+}
+
+
+
+
+
+void verificarServidor_Controle_Oline() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    HTTPClient http;
+  http.begin(String(SERVER) + "/api/horarios/pull");
+
+
+    int httpCode = http.GET();
+    if (httpCode != 200) {
+        http.end();
+        return;
+    }
+
+    String payload = http.getString();
+    http.end();
+
+    StaticJsonDocument<512> doc;
+    if (deserializeJson(doc, payload)) return;
+
+    if (strcmp(doc["status"], "editar") != 0) return;
+
+    JsonObject d = doc["dados"];
+
+    int linha = d["linha"];
+
+    int horaL  = d["hora_ligar"];
+    int minL   = d["minuto_ligar"];
+    int horaD  = d["hora_desligar"];
+    int minD   = d["minuto_desligar"];
+
+    // 🔒 monta CSV no formato ORIGINAL
+    String novaLinha =
+        String(horaL) + "," +
+        String(minL) + "," +
+        String(horaD) + "," +
+        String(minD);
+
+    for (int i = 0; i < 7; i++) {
+        novaLinha += ",";
+        novaLinha += d["dias"][i].as<int>() ? (i + 1) : 0;
+    }
+
+    atualizarLinhaSD("/horarios.txt", linha, novaLinha);
+}
+
+
+
+
+
+
+//////////////////// eviar dados para o servidor //////////////////////
+
+/* ================= UTIL ================= */
+bool linhaVazia(String linha) {
+  linha.trim();
+  return linha.startsWith("-1");
+}
+
+/* ================= ENVIAR HORÁRIOS ================= */
+void enviarHorariosParaServidor() {
+  File f = SD.open("/horarios.txt");
+  if (!f) {
+    Serial.println("❌ horario.txt não encontrado");
+    return;
+  }
+
+  StaticJsonDocument<8192> doc;
+  JsonArray arr = doc.createNestedArray("horarios");
+
+  int linhaIndex = 0;
+
+  while (f.available()) {
+    String linha = f.readStringUntil('\n');
+    linha.trim();
+
+    Serial.println("➡ Linha lida: " + linha);
+
+    if (linhaVazia(linha)) {
+      Serial.println("⚠ Slot vazio, ignorando");
+      linhaIndex++;
+      continue;
+    }
+
+    int valores[11];
+    int i = 0;
+
+    char buf[100];
+    linha.toCharArray(buf, sizeof(buf));
+    char* token = strtok(buf, ",");
+
+    while (token && i < 11) {
+      valores[i++] = atoi(token);
+      token = strtok(NULL, ",");
+    }
+
+    if (i != 11) {
+      Serial.println("⚠ Formato inválido, ignorando");
+      linhaIndex++;
+      continue;
+    }
+
+    JsonObject h = arr.createNestedObject();
+    h["linha"] = linhaIndex;
+    h["hora_ligar"]    = String(valores[0]) + ":" + String(valores[2]);
+    h["hora_desligar"] = String(valores[1]) + ":" + String(valores[3]);
+
+    JsonArray dias = h.createNestedArray("dias");
+    for (int d = 4; d < 11; d++) dias.add(valores[d]);
+
+    linhaIndex++;
+  }
+  f.close();
+
+  if (arr.size() == 0) {
+    Serial.println("⚠ Nenhum horário válido encontrado");
+    return;
+  }
+
+  HTTPClient http;
+  http.begin(String(SERVER) + "/api/horarios/salvar");
+  http.addHeader("Content-Type", "application/json");
+
+  String payload;
+  serializeJson(doc, payload);
+
+  Serial.println("\n📤 JSON enviado:");
+  Serial.println(payload);
+
+  int code = http.POST(payload);
+  Serial.println("HTTP Code: " + String(code));
+  Serial.println("Resposta: " + http.getString());
+
+  http.end();
+}
+
+/* ================= EDITAR HORÁRIO ================= */
+void editarHorario(JsonObject dados) {
+  int linhaEditar = dados["linha"];
+  int hl = dados["hora_ligar"];
+  int ml = dados["minuto_ligar"];
+  int hd = dados["hora_desligar"];
+  int md = dados["minuto_desligar"];
+  JsonArray dias = dados["dias"];
+
+  File f = SD.open("/horarios.txt", FILE_READ);
+  if (!f) return;
+
+  String linhas[600];
+  int total = 0;
+
+  while (f.available()) {
+    linhas[total++] = f.readStringUntil('\n');
+  }
+  f.close();
+
+  if (linhaEditar >= total) return;
+
+  String novaLinha = String(hl) + "," + String(hd) + "," +
+                     String(ml) + "," + String(md);
+
+  for (int i = 0; i < 7; i++) {
+    novaLinha += "," + String((int)dias[i]);
+  }
+
+  linhas[linhaEditar] = novaLinha;
+
+  f = SD.open("/horarios.txt", FILE_WRITE);
+  for (int i = 0; i < total; i++) {
+    f.println(linhas[i]);
+  }
+  f.close();
+
+  Serial.println("✅ Horário atualizado no SD");
+}
+
+/* ================= SERVIDOR ================= */
+void verificarServidor_Dados_dos_horarios() {
+  HTTPClient http;
+  http.begin(String(SERVER) + "/api/horarios/pull");
+
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    return;
+  }
+
+  StaticJsonDocument<1024> doc;
+  deserializeJson(doc, http.getString());
+  http.end();
+
+  String status = doc["status"];
+
+  if (status == "enviar") {
+    Serial.println("📥 Pedido: ENVIAR horários");
+    enviarHorariosParaServidor();
+  }
+  else if (status == "editar") {
+    Serial.println("✏ Pedido: EDITAR horário");
+    editarHorario(doc["dados"]);
+  }
+  else {
+    // idle → não faz nada
+  }
+}

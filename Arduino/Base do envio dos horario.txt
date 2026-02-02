@@ -1,0 +1,200 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <SPI.h>
+#include <SD.h>
+
+#define SD_CS 5
+
+/* ================= CONFIG ================= */
+const char* ssid = "Elson";
+const char* password = "123456789";
+const char* SERVER = "http://192.168.0.6:5000";
+
+/* ================= WIFI ================= */
+void conectarWiFi() {
+  WiFi.begin(ssid, password);
+  Serial.print("Conectando WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ WiFi conectado");
+}
+
+/* ================= SD ================= */
+bool iniciarSD() {
+  if (!SD.begin(SD_CS)) {
+    Serial.println("❌ Falha ao iniciar SD");
+    return false;
+  }
+  Serial.println("✅ SD iniciado");
+  return true;
+}
+
+/* ================= UTIL ================= */
+bool linhaVazia(String linha) {
+  linha.trim();
+  return linha.startsWith("-1");
+}
+
+/* ================= ENVIAR HORÁRIOS ================= */
+void enviarHorariosParaServidor() {
+  File f = SD.open("/horarios.txt");
+  if (!f) {
+    Serial.println("❌ horario.txt não encontrado");
+    return;
+  }
+
+  StaticJsonDocument<8192> doc;
+  JsonArray arr = doc.createNestedArray("horarios");
+
+  int linhaIndex = 0;
+
+  while (f.available()) {
+    String linha = f.readStringUntil('\n');
+    linha.trim();
+
+    Serial.println("➡ Linha lida: " + linha);
+
+    if (linhaVazia(linha)) {
+      Serial.println("⚠ Slot vazio, ignorando");
+      linhaIndex++;
+      continue;
+    }
+
+    int valores[11];
+    int i = 0;
+
+    char buf[100];
+    linha.toCharArray(buf, sizeof(buf));
+    char* token = strtok(buf, ",");
+
+    while (token && i < 11) {
+      valores[i++] = atoi(token);
+      token = strtok(NULL, ",");
+    }
+
+    if (i != 11) {
+      Serial.println("⚠ Formato inválido, ignorando");
+      linhaIndex++;
+      continue;
+    }
+
+    JsonObject h = arr.createNestedObject();
+    h["linha"] = linhaIndex;
+    h["hora_ligar"]    = String(valores[0]) + ":" + String(valores[2]);
+    h["hora_desligar"] = String(valores[1]) + ":" + String(valores[3]);
+
+    JsonArray dias = h.createNestedArray("dias");
+    for (int d = 4; d < 11; d++) dias.add(valores[d]);
+
+    linhaIndex++;
+  }
+  f.close();
+
+  if (arr.size() == 0) {
+    Serial.println("⚠ Nenhum horário válido encontrado");
+    return;
+  }
+
+  HTTPClient http;
+  http.begin(String(SERVER) + "/api/horarios/salvar");
+  http.addHeader("Content-Type", "application/json");
+
+  String payload;
+  serializeJson(doc, payload);
+
+  Serial.println("\n📤 JSON enviado:");
+  Serial.println(payload);
+
+  int code = http.POST(payload);
+  Serial.println("HTTP Code: " + String(code));
+  Serial.println("Resposta: " + http.getString());
+
+  http.end();
+}
+
+/* ================= EDITAR HORÁRIO ================= */
+void editarHorario(JsonObject dados) {
+  int linhaEditar = dados["linha"];
+  int hl = dados["hora_ligar"];
+  int ml = dados["minuto_ligar"];
+  int hd = dados["hora_desligar"];
+  int md = dados["minuto_desligar"];
+  JsonArray dias = dados["dias"];
+
+  File f = SD.open("/horarios.txt", FILE_READ);
+  if (!f) return;
+
+  String linhas[600];
+  int total = 0;
+
+  while (f.available()) {
+    linhas[total++] = f.readStringUntil('\n');
+  }
+  f.close();
+
+  if (linhaEditar >= total) return;
+
+  String novaLinha = String(hl) + "," + String(hd) + "," +
+                     String(ml) + "," + String(md);
+
+  for (int i = 0; i < 7; i++) {
+    novaLinha += "," + String((int)dias[i]);
+  }
+
+  linhas[linhaEditar] = novaLinha;
+
+  f = SD.open("/horarios.txt", FILE_WRITE);
+  for (int i = 0; i < total; i++) {
+    f.println(linhas[i]);
+  }
+  f.close();
+
+  Serial.println("✅ Horário atualizado no SD");
+}
+
+/* ================= SERVIDOR ================= */
+void verificarServidor() {
+  HTTPClient http;
+  http.begin(String(SERVER) + "/api/horarios/pull");
+
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    return;
+  }
+
+  StaticJsonDocument<1024> doc;
+  deserializeJson(doc, http.getString());
+  http.end();
+
+  String status = doc["status"];
+
+  if (status == "enviar") {
+    Serial.println("📥 Pedido: ENVIAR horários");
+    enviarHorariosParaServidor();
+  }
+  else if (status == "editar") {
+    Serial.println("✏ Pedido: EDITAR horário");
+    editarHorario(doc["dados"]);
+  }
+  else {
+    // idle → não faz nada
+  }
+}
+
+/* ================= SETUP ================= */
+void setup() {
+  Serial.begin(115200);
+  conectarWiFi();
+  iniciarSD();
+}
+
+/* ================= LOOP ================= */
+void loop() {
+  verificarServidor();
+  delay(800); // mantém WiFi vivo sem polling agressivo
+}
